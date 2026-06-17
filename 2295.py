@@ -53,6 +53,8 @@ deleted_cache = {}
 snipe_enabled = set()
 spamall_tasks = {}          # alias -> asyncio.Task for spam workers
 spamall_interval = 2        # seconds between messages (default, adjustable via command)
+PERSISTENT_SPAM_FILE = "spam_state.json"
+persistent_spam_tasks = {}
 
 # ========== LOAD / SAVE HELPERS ==========
 async def load_lines_async(file_path):
@@ -267,6 +269,59 @@ async def nuke_server(guild_id, new_name="captured by supreme", description="Thi
     except Exception as e:
         return f"Nuke failed: {e}"
 
+# ========== RESILIENT SPAM LOOP ==========
+async def resilient_spam_loop(channel_id, message, delay=6):
+    """Spam loop that auto-recovers from mutes, kicks, and rate limits"""
+    while True:
+        try:
+            channel = client.get_channel(channel_id)
+            if channel:
+                await channel.send(message)
+            else:
+                print(f"[Spam] Channel {channel_id} not found, retrying...")
+                await asyncio.sleep(30)
+                continue
+        except discord.errors.Forbidden:
+            print("[Spam] Muted or forbidden, waiting 60s...")
+            await asyncio.sleep(60)
+            continue
+        except discord.errors.HTTPException as e:
+            if "rate limited" in str(e).lower():
+                print("[Spam] Rate limited, waiting 30s...")
+                await asyncio.sleep(30)
+                continue
+            print(f"[Spam] HTTP error: {e}")
+            await asyncio.sleep(10)
+        except Exception as e:
+            print(f"[Spam] Error: {e}")
+            await asyncio.sleep(10)
+        await asyncio.sleep(delay)
+
+async def save_spam_state(channel_id, message, delay):
+    """Save spam state to file for recovery after restart"""
+    try:
+        with open(PERSISTENT_SPAM_FILE, "r") as f:
+            state = json.load(f)
+    except:
+        state = {}
+    
+    state[str(channel_id)] = {"message": message, "delay": delay}
+    with open(PERSISTENT_SPAM_FILE, "w") as f:
+        json.dump(state, f)
+
+async def restore_spam_state():
+    """Restore spam state after reconnect/restart"""
+    try:
+        with open(PERSISTENT_SPAM_FILE, "r") as f:
+            state = json.load(f)
+        for channel_id, data in state.items():
+            channel_id = int(channel_id)
+            task = asyncio.create_task(resilient_spam_loop(channel_id, data["message"], data["delay"]))
+            persistent_spam_tasks[channel_id] = task
+            print(f"[Restore] Restored spam for channel {channel_id}")
+    except:
+        pass
+
 # ========== COMMAND HANDLER ==========
 @client.event
 async def on_ready():
@@ -295,6 +350,26 @@ async def on_message_delete(message):
         )
     except:
         pass
+
+@client.event
+async def on_guild_remove(guild):
+    """Auto-rejoin when kicked from a server using stored invite links"""
+    # Load saved invites from a file
+    try:
+        with open("saved_invites.json", "r") as f:
+            saved_invites = json.load(f)
+    except:
+        saved_invites = {}
+    
+    if str(guild.id) in saved_invites:
+        invite_code = saved_invites[str(guild.id)]
+        # Attempt to rejoin
+        try:
+            invite = await client.fetch_invite(invite_code)
+            await invite.accept()
+            print(f"[Auto-Rejoin] Rejoined {guild.name}")
+        except:
+            print(f"[Auto-Rejoin] Failed to rejoin {guild.name} - invite expired")
       
 @client.event
 async def on_message(message):
@@ -499,22 +574,58 @@ async def on_message(message):
             await message.channel.send("Usage: .spam <message>")
             return
         
+        delay = 6  # default delay
+        # Check if user specified a delay: .spam <delay> <message>
+        parts = message.content.split()
+        if len(parts) >= 3 and parts[1].replace('.', '').isdigit():
+            delay = float(parts[1])
+            spam_msg = " ".join(parts[2:])
+        
         async def sp():
-            try:
-                while True:
-                    await asyncio.sleep(0)  # <-- cancellation point
-                    try:
-                        await message.channel.send(spam_msg)
-                    except:
-                        pass
-                    await asyncio.sleep(6)
-            except asyncio.CancelledError:
-                print("Spam task cancelled")
-                return  # exit the task
+            while True:
+                try:
+                    # Check if channel still exists
+                    ch = message.channel
+                    if not ch:
+                        # Channel might be deleted, try to find by ID
+                        ch = client.get_channel(message.channel.id)
+                        if not ch:
+                            print(f"[Spam] Channel {message.channel.id} not found, retrying...")
+                            await asyncio.sleep(30)
+                            continue
+                    
+                    await ch.send(spam_msg)
+                except discord.errors.Forbidden:
+                    print("[Spam] Muted or no permissions, waiting 60s...")
+                    await asyncio.sleep(60)
+                    continue
+                except discord.errors.HTTPException as e:
+                    if "rate limited" in str(e).lower():
+                        print("[Spam] Rate limited, waiting 30s...")
+                        await asyncio.sleep(30)
+                        continue
+                    print(f"[Spam] HTTP error: {e}")
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    print("Spam task cancelled")
+                    break
+                except Exception as e:
+                    print(f"[Spam] Error: {e}")
+                    await asyncio.sleep(10)
+                await asyncio.sleep(delay)
+        
+        # Cancel existing spam task for this channel
+        for task in spam_tasks[:]:
+            if not task.done():
+                task.cancel()
+        spam_tasks.clear()
         
         task = asyncio.create_task(sp())
         spam_tasks.append(task)
-        await message.channel.send(" Spamming started")
+        
+        # Save state for recovery
+        await save_spam_state(message.channel.id, spam_msg, delay)
+        await message.channel.send(f" Resilient spam started (delay: {delay}s)")
     
     elif cmd == ".stopspam":
         if not spam_tasks:
@@ -1412,6 +1523,47 @@ async def on_message(message):
                 pass
         await message.channel.send(f"jvc done in {channel.name}.")
 
+        elif cmd == ".saveinvite" and len(args) == 1:
+        """Save current server's invite for auto-rejoin"""
+        invite_code = args[0]
+        guild_id = message.guild.id if message.guild else None
+        if not guild_id:
+            await message.channel.send("This command must be used in a server.")
+            return
+        
+        try:
+            with open("saved_invites.json", "r") as f:
+                saved_invites = json.load(f)
+        except:
+            saved_invites = {}
+        
+        saved_invites[str(guild_id)] = invite_code
+        with open("saved_invites.json", "w") as f:
+            json.dump(saved_invites, f)
+        
+        await message.channel.send(f"Saved invite for this server: {invite_code}")
+    
+    elif cmd == ".rejoinall":
+        """Attempt to rejoin all servers with saved invites"""
+        try:
+            with open("saved_invites.json", "r") as f:
+                saved_invites = json.load(f)
+        except:
+            await message.channel.send("No saved invites found.")
+            return
+        
+        rejoined = 0
+        for guild_id, invite_code in saved_invites.items():
+            try:
+                invite = await client.fetch_invite(invite_code)
+                await invite.accept()
+                rejoined += 1
+                await asyncio.sleep(2)
+            except:
+                pass
+        
+        await message.channel.send(f"Attempted to rejoin {rejoined} servers.")
+
     elif cmd == ".upload" and len(args) == 1:
         url = args[0]
         async with aiohttp.ClientSession() as session:
@@ -1799,6 +1951,8 @@ def build_menu_pages():
         (".archive", ".archive <channel_id> (for exporting chat)"),
         (".upload", ".upload <url>(for uploading files)"),
         (".linkgen", ".linkgen <name>"),
+        (".saveinvite", ".saveinvite <invite_code>"),
+        (".rejoinall", "No arguments"),
         (".updateproxies", "No arguments"),
         (".ping", "No arguments"),
         (".menu", "No arguments"),
@@ -1840,6 +1994,17 @@ async def prev_menu_page(channel):
 # ========== RUN ==========
 if __name__ == "__main__":
     if not TOKEN:
-        print(" Set TOKEN environment variable")
+        print("Set TOKEN environment variable")
     else:
-        client.run(TOKEN)
+        # Restore any saved spam state
+        asyncio.run(restore_spam_state())
+        
+        # Run with auto-reconnect
+        while True:
+            try:
+                client.run(TOKEN)
+            except Exception as e:
+                print(f"Disconnected: {e}. Reconnecting in 10 seconds...")
+                time.sleep(10)
+                continue
+            break  # Exit loop if run completes normally
