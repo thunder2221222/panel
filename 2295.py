@@ -1523,7 +1523,7 @@ async def on_message(message):
                 pass
         await message.channel.send(f"jvc done in {channel.name}.")
 
-        elif cmd == ".saveinvite" and len(args) == 1:
+    elif cmd == ".saveinvite" and len(args) == 1:
         """Save current server's invite for auto-rejoin"""
         invite_code = args[0]
         guild_id = message.guild.id if message.guild else None
