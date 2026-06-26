@@ -395,87 +395,11 @@ async def on_message(message):
     for token_info in token_pool:
         if token_info.get('user_id'):
             authorized_ids.add(token_info['user_id'])
-    
-# ----- Anti AFK logic (works for ANY user in monitored channel) -----
-    if anti_target_channel and message.channel.id == anti_target_channel:
-        author_id = message.author.id
-        content = message.content
-        if author_id not in anti_user_history:
-            anti_user_history[author_id] = deque(maxlen=10)
-        anti_user_history[author_id].append((content, message))
-        # Check for "tell my alias" (handled separately, not by Groq)
-        if re.search(r'(?:tell|whats?|what is)\s+my\s+alias', content.lower()):
-            if message.guild:
-                member = message.guild.get_member(author_id)
-                alias = member.nick if member and member.nick else message.author.name
-            else:
-                alias = message.author.name
-            target_channel = extract_target_channel(content, message.guild)
-            if target_channel:
-                await target_channel.send(f"# {alias}")
-            else:
-                await message.channel.send(f"# {alias}")
-            return
-        num = parse_count_number(content)
-        if num is not None:
-            last = anti_user_last_number.get(author_id, 0)
-            if num == last + 1:
-                anti_user_last_number[author_id] = num
-                if num == 9:
-                    history = list(anti_user_history.get(author_id, []))
-                    answer = None
-                    for prev_content, _ in reversed(history):
-                        if prev_content == content: continue
-                        ans = extract_answer(prev_content)
-                        if ans:
-                            answer = ans
-                            break
-                    if answer:
-                        target_channel = extract_target_channel(content, message.guild)
-                        if target_channel:
-                            await target_channel.send(f"# {answer}")
-                        else:
-                            await message.channel.send(f"# {answer}")
-                        print(f"Anti AFK replied: {answer}")
-                    anti_user_last_number[author_id] = 0
-            else:
-                anti_user_last_number[author_id] = 0
-        else:
-            anti_user_last_number[author_id] = 0
         
 
     # ----- Command processing only for authorized users -----
     if message.author.id not in authorized_ids:
         return
-
-    # ----- Handle file uploads for pending imports -----
-    if message.attachments and message.author.id in pending_import:
-        name = pending_import.pop(message.author.id)
-        attachment = message.attachments[0]
-        if not attachment.filename.endswith('.txt'):
-            await message.channel.send(f" Only `.txt` files are allowed for wordlists.")
-            return
-        try:
-            # Download the file content
-            async with aiohttp.ClientSession() as session:
-                async with session.get(attachment.url) as resp:
-                    if resp.status == 200:
-                        content = await resp.text()
-                        lines = [l.strip() for l in content.splitlines() if l.strip()]
-                        if not lines:
-                            await message.channel.send(f" File is empty.")
-                            return
-                        # Save as wordlist_<name>.txt
-                        filename = f"{name}.txt"
-                        with open(filename, "w", encoding="utf-8") as f:
-                            f.write("\n".join(lines))
-                        wordlists[name] = lines
-                        await message.channel.send(f" Wordlist **{name}** imported with {len(lines)} lines.")
-                    else:
-                        await message.channel.send(f" Failed to download file (HTTP {resp.status}).")
-        except Exception as e:
-            await message.channel.send(f" Error importing wordlist: {e}")
-        return  # Don't process the message as a command
     
     if not message.content.startswith("."):
         return
@@ -811,7 +735,7 @@ async def handle_command(message, client_instance):
 
     elif cmd == ".importwl" and len(args) == 1:
         name = args[0]
-        pending_import[message.author.id] = name
+        pending_import[client_instance.user.id] = name  # Use client_instance.user.id
         await message.channel.send(f" upload the `.txt` file for wordlist **{name}** now (Send only the file, no extra text)")
 
     elif cmd == ".autopaste" and len(args) >= 3:
