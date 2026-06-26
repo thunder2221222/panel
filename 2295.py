@@ -494,6 +494,9 @@ async def on_message(message):
     await handle_command(message, client)
       
 async def handle_command(message, client_instance):
+    # ONLY process if the message author is the client itself
+    if message.author.id != client_instance.user.id:
+        return
     global anti_target_channel, anti_user_history, anti_user_last_number, tasks
     global status_task, name_task, spam_tasks, afk_task, autopaste_msgs, stam_msgs
     global count_tasks, react_task, stream_task, auto_reply_tasks, gc_task, token_pool
