@@ -332,6 +332,10 @@ async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
     print("Type .menu to see all commands")
 
+   hosted_clients.clear()
+   hosted_tasks.clear()
+   print("[HostAll] Cleared stale hosted client data.")
+
 @client.event
 async def on_message_delete(message):
     # only work if enabled in this channel
@@ -1958,6 +1962,11 @@ async def on_message(message):
 
     elif cmd == ".alltokens":
         """List all hosted tokens with full selfbot access"""
+        # Sync: Remove any tokens from hosted_clients that aren't in token_pool
+        for token in list(hosted_clients.keys()):
+            if not any(t.get("token") == token for t in token_pool):
+                del hosted_clients[token]
+        
         if not token_pool:
             await message.channel.send("No tokens hosted.")
             return
@@ -1973,7 +1982,6 @@ async def on_message(message):
             msg += f"• {alias} (ID: {user_id}) – {status}\n"
         
         if len(msg) > 1900:
-            # Split into chunks if too long
             for i in range(0, len(msg), 1900):
                 await message.channel.send(msg[i:i+1900])
         else:
