@@ -1964,47 +1964,47 @@ async def on_message(message):
             await message.channel.send(msg)
 
     elif cmd == ".ablow" and len(args) == 3:
-    """Auto-beef in lowercase (same as .ab but no uppercase)"""
-    try:
-        ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
-        channel = client.get_channel(ch_id)
-        if not channel:
-            await message.channel.send("Invalid channel ID")
-            return
-        if ch_id in tasks:
-            tasks[ch_id].cancel()
-        
-        async def sched_lower():
-            try:
-                while True:
-                    if fname in wordlists:
-                        lines = wordlists[fname]
-                    else:
-                        lines = await asyncio.to_thread(load_lines, fname)
-                    await asyncio.sleep(0)   # cancellation point
-                    if not lines:
-                        await asyncio.sleep(5)
-                        continue
-                    random.shuffle(lines)
-                    for line in lines:
-                        # Check for cancellation before each send
-                        if asyncio.current_task().cancelled():
-                            return
-                        try:
-                            # Send in lowercase
-                            await channel.send(line.lower())
-                            await asyncio.sleep(delay)
-                        except asyncio.CancelledError:
-                            raise
-                        except:
-                            await asyncio.sleep(5)
-            except asyncio.CancelledError:
+        """Auto-beef in lowercase (same as .ab but no uppercase)"""
+        try:
+            ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
+            channel = client.get_channel(ch_id)
+            if not channel:
+                await message.channel.send("Invalid channel ID")
                 return
-
-        tasks[ch_id] = asyncio.create_task(sched_lower())
-        await message.channel.send(f"ablow started in {ch_id} every {delay}s using {fname} (lowercase)")
-    except:
-        await message.channel.send("Usage: .ablow <channel_id> <delay> <file.txt>")
+            if ch_id in tasks:
+                tasks[ch_id].cancel()
+            
+            async def sched_lower():
+                try:
+                    while True:
+                        if fname in wordlists:
+                            lines = wordlists[fname]
+                        else:
+                            lines = await asyncio.to_thread(load_lines, fname)
+                        await asyncio.sleep(0)   # cancellation point
+                        if not lines:
+                            await asyncio.sleep(5)
+                            continue
+                        random.shuffle(lines)
+                        for line in lines:
+                            # Check for cancellation before each send
+                            if asyncio.current_task().cancelled():
+                                return
+                            try:
+                                # Send in lowercase
+                                await channel.send(line.lower())
+                                await asyncio.sleep(delay)
+                            except asyncio.CancelledError:
+                                raise
+                            except:
+                                await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    return
+    
+            tasks[ch_id] = asyncio.create_task(sched_lower())
+            await message.channel.send(f"ablow started in {ch_id} every {delay}s using {fname} (lowercase)")
+        except:
+            await message.channel.send("Usage: .ablow <channel_id> <delay> <file.txt>")
     
     elif cmd == ".pack" and len(args) >= 4:
         ch_id = int(args[0]); times = int(args[1]); lines = int(args[2]); pack_type = " ".join(args[3:])
