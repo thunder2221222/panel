@@ -444,16 +444,6 @@ async def on_message(message):
             anti_user_last_number[author_id] = 0
         
 
-        # ----- Auto-reaction (instant) -----
-    if message.author == client.user and reaction_emojis:
-        # React to your own messages immediately
-        for emoji in reaction_emojis:
-            try:
-                await message.add_reaction(emoji)
-                await asyncio.sleep(0.2)  # tiny delay between reactions to avoid rate limits
-            except:
-                pass
-
     # ----- Command processing only for authorized users -----
     if message.author.id not in authorized_ids:
         return
