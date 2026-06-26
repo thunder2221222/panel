@@ -1899,8 +1899,8 @@ async def on_message(message):
         
         # Start the hosted client as a background task
         task = asyncio.create_task(run_hosted_token(new_token, username, user_id))
-        hosted_clients[new_token] = temp_client  # Store reference
         hosted_tasks[new_token] = task
+        hosted_clients[new_token] = None  # Placeholder, will be updated inside the task
         
         await message.channel.send(f" **{username}** hosted successfully. Total tokens: {len(token_pool)}")
 
