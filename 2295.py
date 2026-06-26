@@ -332,9 +332,9 @@ async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
     print("Type .menu to see all commands")
 
-   hosted_clients.clear()
-   hosted_tasks.clear()
-   print("[HostAll] Cleared stale hosted client data.")
+    hosted_clients.clear()
+    hosted_tasks.clear()
+    print("[HostAll] Cleared stale hosted client data.")
 
 @client.event
 async def on_message_delete(message):
