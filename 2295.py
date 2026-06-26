@@ -1864,9 +1864,10 @@ async def on_message(message):
         
         # Create a new client for this token
         async def run_hosted_token(token, username, user_id):
-            temp_client = discord.Client()
+            temp_client = discord.Client(self_bot=True)
             try:
                 await temp_client.start(token)
+                hosted_clients[token] = temp_client
                 print(f"[HostAll] {username} logged in")
                 
                 # Add to token_pool so .aball etc can use it
@@ -1886,6 +1887,8 @@ async def on_message(message):
                     if t.get("token") == token:
                         token_pool.pop(i)
                         break
+                if token in hosted_clients:
+                    del hosted_clients[token]
                 await temp_client.close()
                 raise
             except Exception as e:
@@ -1895,14 +1898,27 @@ async def on_message(message):
                     if t.get("token") == token:
                         token_pool.pop(i)
                         break
+                if token in hosted_clients:
+                    del hosted_clients[token]
                 await temp_client.close()
         
         # Start the hosted client as a background task
         task = asyncio.create_task(run_hosted_token(new_token, username, user_id))
         hosted_tasks[new_token] = task
-        hosted_clients[new_token] = None  # Placeholder, will be updated inside the task
+        hosted_clients[new_token] = None
         
-        await message.channel.send(f" **{username}** hosted successfully. Total tokens: {len(token_pool)}")
+        # Wait for the token to be added to token_pool
+        for _ in range(30):  # Wait up to 3 seconds
+            await asyncio.sleep(0.1)
+            if any(t.get("token") == new_token for t in token_pool):
+                break
+        
+        # Check if token was actually added
+        token_in_pool = any(t.get("token") == new_token for t in token_pool)
+        if token_in_pool:
+            await message.channel.send(f" **{username}** hosted successfully. Total tokens: {len(token_pool)}")
+        else:
+            await message.channel.send(f" **{username}** token validation timed out. Check if the token is valid.")
 
     elif cmd == ".unhostall" and len(args) == 1:
         """Unhost a token by username"""
