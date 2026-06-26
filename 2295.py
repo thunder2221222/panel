@@ -376,7 +376,7 @@ async def on_guild_remove(guild):
             print(f"[Auto-Rejoin] Rejoined {guild.name}")
         except:
             print(f"[Auto-Rejoin] Failed to rejoin {guild.name} - invite expired")
-      
+
 @client.event
 async def on_message(message):
     global anti_target_channel, anti_user_history, anti_user_last_number, tasks
@@ -490,6 +490,122 @@ async def on_message(message):
     if not message.content.startswith("."):
         return
 
+    # ====== Process commands using the shared handler ======
+    await handle_command(message, client)
+      
+@client.event
+async def handle_command(message, client_instance):
+    global anti_target_channel, anti_user_history, anti_user_last_number, tasks
+    global status_task, name_task, spam_tasks, afk_task, autopaste_msgs, stam_msgs
+    global count_tasks, react_task, stream_task, auto_reply_tasks, gc_task, token_pool
+    global BEEF_WORDS, main_user_id, tool_channel_id, current_menu_page, reaction_emojis
+
+        # store message info
+    deleted_cache[message.id] = {
+        "content": message.content,
+        "author": f"{message.author} ({message.author.id})",
+        "time": message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    authorized_ids = {client_instance.user.id}   # allow the current client's user
+    for token_info in token_pool:
+        if token_info.get('user_id'):
+            authorized_ids.add(token_info['user_id'])
+    
+# ----- Anti AFK logic (works for ANY user in monitored channel) -----
+    if anti_target_channel and message.channel.id == anti_target_channel:
+        author_id = message.author.id
+        content = message.content
+        if author_id not in anti_user_history:
+            anti_user_history[author_id] = deque(maxlen=10)
+        anti_user_history[author_id].append((content, message))
+        # Check for "tell my alias" (handled separately, not by Groq)
+        if re.search(r'(?:tell|whats?|what is)\s+my\s+alias', content.lower()):
+            if message.guild:
+                member = message.guild.get_member(author_id)
+                alias = member.nick if member and member.nick else message.author.name
+            else:
+                alias = message.author.name
+            target_channel = extract_target_channel(content, message.guild)
+            if target_channel:
+                await target_channel.send(f"# {alias}")
+            else:
+                await message.channel.send(f"# {alias}")
+            return
+        num = parse_count_number(content)
+        if num is not None:
+            last = anti_user_last_number.get(author_id, 0)
+            if num == last + 1:
+                anti_user_last_number[author_id] = num
+                if num == 9:
+                    history = list(anti_user_history.get(author_id, []))
+                    answer = None
+                    for prev_content, _ in reversed(history):
+                        if prev_content == content: continue
+                        ans = extract_answer(prev_content)
+                        if ans:
+                            answer = ans
+                            break
+                    if answer:
+                        target_channel = extract_target_channel(content, message.guild)
+                        if target_channel:
+                            await target_channel.send(f"# {answer}")
+                        else:
+                            await message.channel.send(f"# {answer}")
+                        print(f"Anti AFK replied: {answer}")
+                    anti_user_last_number[author_id] = 0
+            else:
+                anti_user_last_number[author_id] = 0
+        else:
+            anti_user_last_number[author_id] = 0
+        
+
+        # ----- Auto-reaction (instant) -----
+    if message.author == client.user and reaction_emojis:
+        # React to your own messages immediately
+        for emoji in reaction_emojis:
+            try:
+                await message.add_reaction(emoji)
+                await asyncio.sleep(0.2)  # tiny delay between reactions to avoid rate limits
+            except:
+                pass
+
+    # ----- Command processing only for authorized users -----
+    if message.author.id not in authorized_ids:
+        return
+
+    # ----- Handle file uploads for pending imports -----
+    if message.attachments and message.author.id in pending_import:
+        name = pending_import.pop(message.author.id)
+        attachment = message.attachments[0]
+        if not attachment.filename.endswith('.txt'):
+            await message.channel.send(f" Only `.txt` files are allowed for wordlists.")
+            return
+        try:
+            # Download the file content
+            async with aiohttp.ClientSession() as session:
+                async with session.get(attachment.url) as resp:
+                    if resp.status == 200:
+                        content = await resp.text()
+                        lines = [l.strip() for l in content.splitlines() if l.strip()]
+                        if not lines:
+                            await message.channel.send(f" File is empty.")
+                            return
+                        # Save as wordlist_<name>.txt
+                        filename = f"{name}.txt"
+                        with open(filename, "w", encoding="utf-8") as f:
+                            f.write("\n".join(lines))
+                        wordlists[name] = lines
+                        await message.channel.send(f" Wordlist **{name}** imported with {len(lines)} lines.")
+                    else:
+                        await message.channel.send(f" Failed to download file (HTTP {resp.status}).")
+        except Exception as e:
+            await message.channel.send(f" Error importing wordlist: {e}")
+        return  # Don't process the message as a command
+    
+    if not message.content.startswith("."):
+        return
+
     parts = message.content.split()
     cmd = parts[0].lower()
     args = parts[1:]
@@ -498,7 +614,7 @@ async def on_message(message):
     if cmd == ".ab" and len(args) == 3:
         try:
             ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
-            channel = client.get_channel(ch_id)
+            channel = client_instance.get_channel(ch_id)
             if not channel:
                 await message.channel.send("Invalid channel ID")
                 return
@@ -594,7 +710,7 @@ async def on_message(message):
                     ch = message.channel
                     if not ch:
                         # Channel might be deleted, try to find by ID
-                        ch = client.get_channel(message.channel.id)
+                        ch = client_instance.get_channel(message.channel.id)
                         if not ch:
                             print(f"[Spam] Channel {message.channel.id} not found, retrying...")
                             await asyncio.sleep(30)
@@ -721,7 +837,7 @@ async def on_message(message):
                             continue
                         for d, m in autopaste_msgs[ch_id]:
                             try:
-                                ch = client.get_channel(ch_id)
+                                ch = client_instance.get_channel(ch_id)
                                 if ch: await ch.send(m)
                             except: pass
                             await asyncio.sleep(d)
@@ -772,7 +888,7 @@ async def on_message(message):
                             continue
                         for d, m in stam_msgs[ch_id]:
                             try:
-                                ch = client.get_channel(ch_id)
+                                ch = client_instance.get_channel(ch_id)
                                 if ch: await ch.send(m)
                             except: pass
                             await asyncio.sleep(d)
@@ -818,7 +934,7 @@ async def on_message(message):
                             print(f"Count task for {ch_id} cancelled (check 1)")
                             break
                         try:
-                            ch = client.get_channel(ch_id)
+                            ch = client_instance.get_channel(ch_id)
                             if ch: 
                                 await ch.send(str(i))
                             i += 1
@@ -860,7 +976,7 @@ async def on_message(message):
                             print(f"Countdown task for {ch_id} cancelled")
                             break
                         try:
-                            ch = client.get_channel(ch_id)
+                            ch = client_instance.get_channel(ch_id)
                             if ch: 
                                 await ch.send(str(i))
                             # Break 1 second delay into smaller chunks
@@ -922,11 +1038,11 @@ async def on_message(message):
             try:
                 while True:
                     for t in texts:
-                        await client.change_presence(activity=discord.Streaming(name=t.strip(), url="https://twitch.tv/yourchannel"))
+                        await client_instance.change_presence(activity=discord.Streaming(name=t.strip(), url="https://twitch.tv/yourchannel"))
                         await asyncio.sleep(10)
             except asyncio.CancelledError:
                 # Clear presence when cancelled
-                await client.change_presence(activity=None)
+                await client_instance.change_presence(activity=None)
                 raise
         stream_task = asyncio.create_task(stream_loop())
         await message.channel.send(f"Stream rotation started: {texts}")
@@ -971,7 +1087,7 @@ async def on_message(message):
             try:
                 while True:
                     try:
-                        ch = client.get_channel(channel_id)
+                        ch = client_instance.get_channel(channel_id)
                         if ch:
                             # Get the last 10 messages in that channel
                             async for msg in ch.history(limit=10):
@@ -1026,7 +1142,7 @@ async def on_message(message):
         async def gc_loop():
             while True:
                 try:
-                    ch = client.get_channel(ch_id)
+                    ch = client_instance.get_channel(ch_id)
                     if ch and isinstance(ch, discord.GroupChannel):
                         await ch.edit(name=name)
                         await asyncio.sleep(delay)
@@ -1046,7 +1162,7 @@ async def on_message(message):
 
     elif cmd == ".lockgc" and len(args) == 2:
         ch_id = int(args[0]); name = args[1]
-        ch = client.get_channel(ch_id)
+        ch = client_instance.get_channel(ch_id)
         if ch and isinstance(ch, discord.GroupChannel):
             await ch.edit(name=name, reason="Locked")
             await message.channel.send(f"GC locked with name {name}")
@@ -1060,13 +1176,13 @@ async def on_message(message):
         amount = int(args[0])
         channel = message.channel
         if len(args) > 1:
-            channel = client.get_channel(int(args[1]))
+            channel = client_instance.get_channel(int(args[1]))
         if not channel:
             await message.channel.send("Invalid channel")
             return
         deleted = 0
         async for msg in channel.history(limit=amount):
-            if msg.author == client.user:
+            if msg.author == client_instance.user:
                 try:
                     await msg.delete()
                     deleted += 1
@@ -1322,7 +1438,7 @@ async def on_message(message):
                         if not mimic_enabled:
                             return
                         # If the message author is the main bot (self-bot) and not from the mimic client itself
-                        if msg.author.id == client.user.id and msg.author != temp_client.user:
+                        if msg.author.id == client_instance.user.id and msg.author != temp_client.user:
                             try:
                                 # Send the same message to the same channel
                                 await msg.channel.send(msg.content)
@@ -1515,7 +1631,7 @@ async def on_message(message):
     elif cmd == ".vcspam" and len(args) == 2:
         ch_id = int(args[0])
         loops = int(args[1])
-        channel = client.get_channel(ch_id)
+        channel = client_instance.get_channel(ch_id)
         if not channel or not isinstance(channel, discord.VoiceChannel):
             await message.channel.send("Invalid voice channel ID.")
             return
@@ -1561,7 +1677,7 @@ async def on_message(message):
         rejoined = 0
         for guild_id, invite_code in saved_invites.items():
             try:
-                invite = await client.fetch_invite(invite_code)
+                invite = await client_instance.fetch_invite(invite_code)
                 await invite.accept()
                 rejoined += 1
                 await asyncio.sleep(2)
@@ -1631,7 +1747,7 @@ async def on_message(message):
         channel = None
         limit = 1000  # default limit
         if len(args) >= 1 and args[0].isdigit():
-            channel = client.get_channel(int(args[0]))
+            channel = client_instance.get_channel(int(args[0]))
             if not channel:
                 await message.channel.send("Invalid channel ID.")
                 return
@@ -1980,7 +2096,7 @@ async def on_message(message):
         """Auto-beef in lowercase (same as .ab but no uppercase)"""
         try:
             ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
-            channel = client.get_channel(ch_id)
+            channel = client_instance.get_channel(ch_id)
             if not channel:
                 await message.channel.send("Invalid channel ID")
                 return
@@ -2021,7 +2137,7 @@ async def on_message(message):
     
     elif cmd == ".pack" and len(args) >= 4:
         ch_id = int(args[0]); times = int(args[1]); lines = int(args[2]); pack_type = " ".join(args[3:])
-        channel = client.get_channel(ch_id)
+        channel = client_instance.get_channel(ch_id)
         if not channel:
             await message.channel.send("Invalid channel")
             return
@@ -2069,7 +2185,7 @@ async def on_message(message):
         await message.channel.send(f"Uptime: {hours}h {minutes}m {seconds}s")
 
     elif cmd == ".ping":
-        latency = round(client.latency * 1000)
+        latency = round(client_instance.latency * 1000)
         await message.channel.send(f"Ping is {latency}ms")
 
 # ========== MENU PAGINATION ==========
