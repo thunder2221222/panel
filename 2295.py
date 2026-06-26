@@ -563,7 +563,7 @@ async def handle_command(message, client_instance):
         
 
         # ----- Auto-reaction (instant) -----
-    if message.author == client.user and reaction_emojis:
+    if message.author == client_instance.user and reaction_emojis:
         # React to your own messages immediately
         for emoji in reaction_emojis:
             try:
