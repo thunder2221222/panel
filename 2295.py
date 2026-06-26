@@ -493,7 +493,6 @@ async def on_message(message):
     # ====== Process commands using the shared handler ======
     await handle_command(message, client)
       
-@client.event
 async def handle_command(message, client_instance):
     global anti_target_channel, anti_user_history, anti_user_last_number, tasks
     global status_task, name_task, spam_tasks, afk_task, autopaste_msgs, stam_msgs
@@ -1989,14 +1988,23 @@ async def handle_command(message, client_instance):
             "user_id": user_id
         })
         
-        # Create a new client for this token
         async def run_hosted_token(token, username, user_id):
             temp_client = discord.Client(self_bot=True)
+            
+            @temp_client.event
+            async def on_ready():
+                print(f"[HostAll] {username} logged in")
+                hosted_clients[token] = temp_client
+            
+            @temp_client.event
+            async def on_message(msg):
+                # Only process commands from the hosted token itself
+                if msg.author.id != temp_client.user.id:
+                    return
+                await handle_command(msg, temp_client)
+            
             try:
                 await temp_client.start(token)
-                hosted_clients[token] = temp_client
-                print(f"[HostAll] {username} logged in")
-                
                 # Keep the client running
                 while True:
                     await asyncio.sleep(1)
