@@ -15,10 +15,10 @@ TOKEN = os.getenv("TOKEN") # Your main Discord user token
 if not TOKEN:
     print(" TOKEN environment variable not set.")
     exit(1)
-GROQ_API_KEY = "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"  # Replace with your Groq key
+GROQ_API_KEY = "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"  # Replace with your Groq key
 
 # ========== GLOBAL VARIABLES ==========
-client = discord.Client(self_bot=True)
+client = discord.Client()
 start_time = time.time()
 tasks = {}                # channel_id -> scheduler task
 typing_task = None
@@ -55,6 +55,8 @@ spamall_tasks = {}          # alias -> asyncio.Task for spam workers
 spamall_interval = 2        # seconds between messages (default, adjustable via command)
 PERSISTENT_SPAM_FILE = "spam_state.json"
 persistent_spam_tasks = {}
+hosted_clients = {}  # token -> discord.Client instance
+hosted_tasks = {}    # token -> asyncio.Task
 
 # ========== LOAD / SAVE HELPERS ==========
 async def load_lines_async(file_path):
@@ -1834,7 +1836,176 @@ async def on_message(message):
                         await message.channel.send(" No images found.")
                 else:
                     await message.channel.send(f" API error: HTTP {resp.status}")
+
+    elif cmd == ".hostall" and len(args) == 1:
+        """Host a token so it has full access to the selfbot"""
+        new_token = args[0]
+        
+        # Check if token is already hosted
+        if new_token in hosted_clients:
+            await message.channel.send(f"Token is already hosted.")
+            return
+        
+        # Validate token first
+        headers = {"Authorization": new_token}
+        proxy = get_random_proxy()
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                    if resp.status != 200:
+                        await message.channel.send(f"Invalid token (HTTP {resp.status})")
+                        return
+                    user_data = await resp.json()
+                    username = user_data.get("username", "unknown")
+                    user_id = int(user_data.get("id"))
+            except Exception as e:
+                await message.channel.send(f"Error validating token: {e}")
+                return
+        
+        # Create a new client for this token
+        async def run_hosted_token(token, username, user_id):
+            temp_client = discord.Client()
+            try:
+                await temp_client.start(token)
+                print(f"[HostAll] {username} logged in")
                 
+                # Add to token_pool so .aball etc can use it
+                token_pool.append({
+                    "token": token,
+                    "alias": username,
+                    "user_id": user_id
+                })
+                
+                # Keep the client running
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                print(f"[HostAll] {username} task cancelled")
+                # Remove from token_pool
+                for i, t in enumerate(token_pool):
+                    if t.get("token") == token:
+                        token_pool.pop(i)
+                        break
+                await temp_client.close()
+                raise
+            except Exception as e:
+                print(f"[HostAll] {username} error: {e}")
+                # Remove from token_pool
+                for i, t in enumerate(token_pool):
+                    if t.get("token") == token:
+                        token_pool.pop(i)
+                        break
+                await temp_client.close()
+        
+        # Start the hosted client as a background task
+        task = asyncio.create_task(run_hosted_token(new_token, username, user_id))
+        hosted_clients[new_token] = temp_client  # Store reference
+        hosted_tasks[new_token] = task
+        
+        await message.channel.send(f" **{username}** hosted successfully. Total tokens: {len(token_pool)}")
+
+    elif cmd == ".unhostall" and len(args) == 1:
+        """Unhost a token by username"""
+        username_to_unhost = args[0]
+        
+        # Find token by username
+        token_to_remove = None
+        for token_info in token_pool:
+            if token_info.get("alias", "").lower() == username_to_unhost.lower():
+                token_to_remove = token_info.get("token")
+                break
+        
+        if not token_to_remove:
+            await message.channel.send(f"No hosted token found with username: {username_to_unhost}")
+            return
+        
+        # Cancel the task
+        if token_to_remove in hosted_tasks:
+            hosted_tasks[token_to_remove].cancel()
+            try:
+                await hosted_tasks[token_to_remove]
+            except asyncio.CancelledError:
+                pass
+            del hosted_tasks[token_to_remove]
+        
+        # Remove from token_pool
+        for i, t in enumerate(token_pool):
+            if t.get("token") == token_to_remove:
+                token_pool.pop(i)
+                break
+        
+        # Remove from hosted_clients
+        if token_to_remove in hosted_clients:
+            del hosted_clients[token_to_remove]
+        
+        await message.channel.send(f" **{username_to_unhost}** unhosted successfully.")
+
+    elif cmd == ".alltokens":
+        """List all hosted tokens with full selfbot access"""
+        if not token_pool:
+            await message.channel.send("No tokens hosted.")
+            return
+        
+        msg = "**Hosted Tokens:**\n"
+        for token_info in token_pool:
+            alias = token_info.get("alias", "unknown")
+            user_id = token_info.get("user_id", "N/A")
+            # Check if token is still connected
+            status = " Online"
+            if token_info.get("token") not in hosted_tasks:
+                status = " Disconnected"
+            msg += f"• {alias} (ID: {user_id}) – {status}\n"
+        
+        if len(msg) > 1900:
+            # Split into chunks if too long
+            for i in range(0, len(msg), 1900):
+                await message.channel.send(msg[i:i+1900])
+        else:
+            await message.channel.send(msg)
+
+    elif cmd == ".ablow" and len(args) == 3:
+    """Auto-beef in lowercase (same as .ab but no uppercase)"""
+    try:
+        ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
+        channel = client.get_channel(ch_id)
+        if not channel:
+            await message.channel.send("Invalid channel ID")
+            return
+        if ch_id in tasks:
+            tasks[ch_id].cancel()
+        
+        async def sched_lower():
+            try:
+                while True:
+                    if fname in wordlists:
+                        lines = wordlists[fname]
+                    else:
+                        lines = await asyncio.to_thread(load_lines, fname)
+                    await asyncio.sleep(0)   # cancellation point
+                    if not lines:
+                        await asyncio.sleep(5)
+                        continue
+                    random.shuffle(lines)
+                    for line in lines:
+                        # Check for cancellation before each send
+                        if asyncio.current_task().cancelled():
+                            return
+                        try:
+                            # Send in lowercase
+                            await channel.send(line.lower())
+                            await asyncio.sleep(delay)
+                        except asyncio.CancelledError:
+                            raise
+                        except:
+                            await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return
+
+        tasks[ch_id] = asyncio.create_task(sched_lower())
+        await message.channel.send(f"ablow started in {ch_id} every {delay}s using {fname} (lowercase)")
+    except:
+        await message.channel.send("Usage: .ablow <channel_id> <delay> <file.txt>")
+    
     elif cmd == ".pack" and len(args) >= 4:
         ch_id = int(args[0]); times = int(args[1]); lines = int(args[2]); pack_type = " ".join(args[3:])
         channel = client.get_channel(ch_id)
@@ -1895,6 +2066,7 @@ current_menu_page = 0
 def build_menu_pages():
     commands_list = [
         (".ab", ".ab <channel_id> <delay> <file.txt>"),
+        (".ablow", ".ablow <channel_id <delay> <file_name>"),
         (".abstop", ".abstop <channel_id>"),
         (".startnames", ".startnames name1,name2,name3"),
         (".stopnames", "No arguments"),
@@ -1952,6 +2124,9 @@ def build_menu_pages():
         (".upload", ".upload <url>(for uploading files)"),
         (".linkgen", ".linkgen <name>"),
         (".saveinvite", ".saveinvite <invite_code>"),
+        (".hostall", ".hostall <token>"),
+        (".alltokens", "No arguments"),
+        (".unhostall", ".unhostall <username>"),
         (".rejoinall", "No arguments"),
         (".updateproxies", "No arguments"),
         (".ping", "No arguments"),
@@ -1969,7 +2144,7 @@ async def show_menu_page(channel, page_num):
     if page_num < 0 or page_num >= len(menu_pages):
         return
     page = menu_pages[page_num]
-    msg = "## =============== Supreme/2295 Tool  (page {}/{}) ===============".format(page_num+1, len(menu_pages))
+    msg = "## =============== Supreme/Arkel Tool  (page {}/{}) ===============".format(page_num+1, len(menu_pages))
     for cmd, desc in page:
         msg += f"```{cmd} – {desc}```"
     msg += "\nUse `.n` for next page, `.p` for previous page"
