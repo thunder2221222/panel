@@ -264,6 +264,35 @@ class SupremeBot(commands.Bot):
                 "author": f"{message.author} ({message.author.id})",
                 "time": message.created_at.strftime("%Y-%m-%d %H:%M:%S")
             }
+
+            #  HANDLE FILE UPLOADS FOR IMPORTWL
+            if message.attachments and message.author.id in self.pending_import:
+                name = self.pending_import.pop(message.author.id)
+                attachment = message.attachments[0]
+                if not attachment.filename.endswith('.txt'):
+                    await message.channel.send(f" Only `.txt` files are allowed for wordlists.")
+                    return
+                
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(attachment.url) as resp:
+                            if resp.status == 200:
+                                content = await resp.text()
+                                lines = [l.strip() for l in content.splitlines() if l.strip()]
+                                if not lines:
+                                    await message.channel.send(f" File is empty.")
+                                    return
+                                # Save as wordlist_<name>.txt
+                                filename = f"{name}.txt"
+                                with open(filename, "w", encoding="utf-8") as f:
+                                    f.write("\n".join(lines))
+                                self.wordlists[name] = lines
+                                await message.channel.send(f" Wordlist **{name}** imported with {len(lines)} lines.")
+                            else:
+                                await message.channel.send(f" Failed to download file (HTTP {resp.status}).")
+                except Exception as e:
+                    await message.channel.send(f" Error importing wordlist: {e}")
+                return
             
             #  Auto-reaction to your own messages
             if message.author == self.user and self.reaction_emojis:
@@ -851,21 +880,32 @@ class SupremeBot(commands.Bot):
                 await ctx.send("Invalid channel ID!")
                 return
             
+            #  Load wordlist correctly
             if wordlist_name:
+                # Try from memory first
                 if wordlist_name in ctx.bot.wordlists:
                     ctx.bot.BEEF_WORDS = ctx.bot.wordlists[wordlist_name]
                 else:
+                    # Try loading from file (without "wordlist_" prefix if user didn't specify)
                     lines = load_lines(f"wordlist_{wordlist_name}.txt")
+                    if not lines:
+                        lines = load_lines(f"{wordlist_name}.txt")
                     if lines:
                         ctx.bot.wordlists[wordlist_name] = lines
                         ctx.bot.BEEF_WORDS = lines
                     else:
-                        await ctx.send(f"Wordlist `{wordlist_name}` not found.")
+                        await ctx.send(f" Wordlist `{wordlist_name}` not found. Use `.wordlist {wordlist_name}` first.")
                         return
             else:
                 if not ctx.bot.BEEF_WORDS:
-                    ctx.bot.BEEF_WORDS = load_lines("beef.txt") or ["You got rekt", "L + ratio", "Get owned"]
+                    ctx.bot.BEEF_WORDS = load_lines("beef.txt") or ["no sentences to send"]
             
+            #  Check if wordlist is empty
+            if not ctx.bot.BEEF_WORDS:
+                await ctx.send(" Wordlist is empty! Add some words first.")
+                return
+            
+            # Cancel existing tasks
             for alias, task in list(ctx.bot.aball_tasks.items()):
                 if not task.done():
                     task.cancel()
@@ -876,8 +916,10 @@ class SupremeBot(commands.Bot):
                 proxy = get_random_proxy()
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-                try:
-                    async with aiohttp.ClientSession() as session:
+                
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        #  Verify token
                         async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
                             if resp.status != 200:
                                 print(f"[Beef] {alias} token invalid: HTTP {resp.status}")
@@ -885,29 +927,40 @@ class SupremeBot(commands.Bot):
                             user_data = await resp.json()
                             print(f"[Beef] {alias} authenticated as {user_data['username']}")
                         
+                        #  Main loop
                         while True:
-                            await asyncio.sleep(0)
+                            await asyncio.sleep(0.1)  # Small delay to avoid tight loop
+                            
                             word = random.choice(ctx.bot.BEEF_WORDS)
                             payload = {"content": word}
-                            async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
-                                if resp.status not in (200, 204):
-                                    print(f"[Beef] {alias} send failed: {resp.status}")
-                                else:
-                                    print(f"[Beef] {alias} sent: {word}")
-                            await asyncio.sleep(2)
-                except asyncio.CancelledError:
-                    print(f"[Beef] {alias} task cancelled")
-                except Exception as e:
-                    print(f"[Beef] {alias} error: {e}")
-                    await ctx.send(f"**{alias}** error: {e}")
+                            
+                            try:
+                                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                    if resp.status in (200, 204):
+                                        print(f"[Beef] {alias} sent: {word}")
+                                    else:
+                                        print(f"[Beef] {alias} send failed: {resp.status}")
+                                        await asyncio.sleep(5)  # Wait on failure
+                            except Exception as e:
+                                print(f"[Beef] {alias} error: {e}")
+                                await asyncio.sleep(5)
+                            
+                            await asyncio.sleep(2)  # Delay between messages
+                            
+                    except asyncio.CancelledError:
+                        print(f"[Beef] {alias} task cancelled")
+                    except Exception as e:
+                        print(f"[Beef] {alias} error: {e}")
             
+            #  Start workers
             for token_info in ctx.bot.token_pool:
                 alias = token_info.get("alias", "unknown")
                 task = asyncio.create_task(beef_worker(token_info, target_channel_id, alias))
                 ctx.bot.aball_tasks[alias] = task
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)  # Small delay between starting workers
             
-            await ctx.send(f"Auto-beef started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}>")
+            wl_msg = f" using wordlist `{wordlist_name}`" if wordlist_name else " using default beef list"
+            await ctx.send(f" Auto-beef started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}>{wl_msg}")
         
         @self.command(name='aballstop')
         async def aballstop(ctx):
