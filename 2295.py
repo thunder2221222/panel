@@ -242,6 +242,9 @@ class SupremeBot(commands.Bot):
         self.persistent_spam_tasks = {}
         self.PERSISTENT_SPAM_FILE = "spam_state.json"
         self.token_pool = []
+        self.multireact_tasks = {}
+        self.multistam_tasks = {}
+        self.multicount_tasks = {}
         
     async def setup_hook(self):
         """Called automatically when the bot is ready to set up commands"""
@@ -937,7 +940,7 @@ class SupremeBot(commands.Bot):
                             try:
                                 async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
                                     if resp.status in (200, 204):
-                                        print(f"[Beef] {alias} sent: {word}")
+                                        pass
                                     else:
                                         print(f"[Beef] {alias} send failed: {resp.status}")
                                         await asyncio.sleep(5)  # Wait on failure
@@ -1437,6 +1440,434 @@ class SupremeBot(commands.Bot):
                         await ctx.send(f"Token is **VALID**\nUser: `{data['username']}`\nID: `{data['id']}`")
                     else:
                         await ctx.send(f"Token is **INVALID** (HTTP {resp.status})")
+
+        # ========== MULTISTREAM ==========
+        @self.command(name='multistream')
+        async def multistream(ctx, *, names: str):
+            """Spawn multiple selfbot connections to show multiple streams at once"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            statuses = [name.strip() for name in names.split(',') if name.strip()]
+            
+            if not statuses:
+                await ctx.send(" Usage: `.multistream s,u,p,r,e,m,e`")
+                return
+            
+            if len(statuses) > 10:
+                await ctx.send(" Max 10 streams.")
+                return
+            
+            # Get the token from the current bot
+            token = ctx.bot.token
+            
+            # Store background tasks
+            if not hasattr(ctx.bot, 'multistream_tasks'):
+                ctx.bot.multistream_tasks = []
+            
+            # Cancel existing multi-stream tasks
+            for task in ctx.bot.multistream_tasks:
+                if not task.done():
+                    task.cancel()
+            ctx.bot.multistream_tasks.clear()
+            
+            async def stream_worker(stream_name, index):
+                """Each worker runs a separate selfbot connection"""
+                try:
+                    # Create a new bot instance for this stream
+                    bot = commands.Bot(command_prefix="!", self_bot=True)
+                    
+                    @bot.event
+                    async def on_ready():
+                        print(f"[MultiStream] Set stream: {stream_name}")
+                        await bot.change_presence(
+                            activity=discord.Streaming(
+                                name=stream_name,
+                                url="https://twitch.tv/yourchannel"
+                            )
+                        )
+                    
+                    # Start the bot
+                    await bot.start(token)
+                    
+                except Exception as e:
+                    print(f"[MultiStream] Error: {e}")
+            
+            # Start a new worker for each stream name
+            for i, name in enumerate(statuses):
+                task = asyncio.create_task(stream_worker(name, i))
+                ctx.bot.multistream_tasks.append(task)
+                await asyncio.sleep(0.5)  # Small delay to avoid rate limits
+            
+            await ctx.send(f" **Now Streaming {len(statuses)} activities:**\n" + "\n".join([f"`• {s}`" for s in statuses]))
+
+        # ========== STOP MULTISTREAM (Full Cleanup) ==========
+        @self.command(name='stopmultistream')
+        async def stopmultistream(ctx):
+            """Stop all multi-stream connections and clear statuses"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not hasattr(ctx.bot, 'multistream_tasks') or not ctx.bot.multistream_tasks:
+                await ctx.send(" No active multi-stream connections.")
+                return
+            
+            count = 0
+            for task in ctx.bot.multistream_tasks:
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            
+            ctx.bot.multistream_tasks.clear()
+            
+            #  Force clear ALL presences
+            await ctx.bot.change_presence(
+                status=discord.Status.online,
+                activity=None
+            )
+            
+            #  Also reset the main bot's streaming status
+            try:
+                await ctx.bot.change_presence(
+                    activity=discord.Streaming(
+                        name=" ",
+                        url="https://twitch.tv/yourchannel"
+                    )
+                )
+                await asyncio.sleep(1)
+                await ctx.bot.change_presence(activity=None)
+            except:
+                pass
+            
+            await ctx.send(f" Stopped {count} multi-stream connection(s) and cleared all statuses.")
+
+        # ========== MULTIREACT ==========
+        @self.command(name='multireact')
+        async def multireact(ctx, channel_id: int = None, *, emojis: str = None):
+            """React to messages from all hosted tokens - .multireact [channel_id] 😂 🔥"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not ctx.bot.token_pool:
+                await ctx.send(" No tokens loaded. Use `.host <token>` first.")
+                return
+            
+            target_channel_id = channel_id or ctx.channel.id
+            if channel_id and not ctx.bot.get_channel(channel_id):
+                await ctx.send(" Invalid channel ID!")
+                return
+            
+            if not emojis:
+                await ctx.send(" Usage: `.multireact [channel_id] 😂 🔥`")
+                return
+            
+            emoji_list = [e.strip() for e in emojis.split()]
+            
+            # Cancel existing tasks
+            if hasattr(ctx.bot, 'multireact_tasks'):
+                for alias, task in list(ctx.bot.multireact_tasks.items()):
+                    if not task.done():
+                        task.cancel()
+            ctx.bot.multireact_tasks = {}
+            
+            async def react_worker(token_info, channel_id, alias, emojis):
+                token = token_info["token"]
+                proxy = get_random_proxy()
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+                
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        # Verify token
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                            if resp.status != 200:
+                                print(f"[MultiReact] {alias} token invalid: HTTP {resp.status}")
+                                return
+                            user_data = await resp.json()
+                            print(f"[MultiReact] {alias} authenticated as {user_data['username']}")
+                        
+                        # Get recent messages in channel
+                        msg_ids = []
+                        async with session.get(url, headers=headers, proxy=proxy) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for msg in data:
+                                    msg_ids.append(msg['id'])
+                            else:
+                                print(f"[MultiReact] {alias} failed to fetch messages: {resp.status}")
+                                return
+                        
+                        # Add reactions to each message
+                        for msg_id in msg_ids[:10]:  # React to last 10 messages
+                            for emoji in emojis:
+                                try:
+                                    react_url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{msg_id}/reactions/{emoji}/@me"
+                                    async with session.put(react_url, headers=headers, proxy=proxy) as resp:
+                                        if resp.status in (200, 204):
+                                            pass
+                                        else:
+                                            print(f"[MultiReact] {alias} failed: {resp.status}")
+                                    await asyncio.sleep(0.3)
+                                except Exception as e:
+                                    print(f"[MultiReact] {alias} error: {e}")
+                                    await asyncio.sleep(1)
+                            await asyncio.sleep(0.5)
+                            
+                    except asyncio.CancelledError:
+                        print(f"[MultiReact] {alias} task cancelled")
+                    except Exception as e:
+                        print(f"[MultiReact] {alias} error: {e}")
+            
+            # Start workers
+            for token_info in ctx.bot.token_pool:
+                alias = token_info.get("alias", "unknown")
+                task = asyncio.create_task(react_worker(token_info, target_channel_id, alias, emoji_list))
+                ctx.bot.multireact_tasks[alias] = task
+                await asyncio.sleep(0.5)
+            
+            await ctx.send(f" MultiReact started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}>")
+        
+        # ========== STOP MULTIREACT ==========
+        @self.command(name='stopmultireact')
+        async def stopmultireact(ctx):
+            """Stop all multi-reaction tasks"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not hasattr(ctx.bot, 'multireact_tasks') or not ctx.bot.multireact_tasks:
+                await ctx.send(" No active multireact tasks.")
+                return
+            
+            count = 0
+            for alias, task in list(ctx.bot.multireact_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            ctx.bot.multireact_tasks.clear()
+            
+            await ctx.send(f" Stopped {count} multireact task(s).")
+
+        # ========== MULTISTAM ==========
+        @self.command(name='multistam')
+        async def multistam(ctx, channel_id: int = None, delay: float = 2.0, *, message: str = None):
+            """Stam from all hosted tokens - .multistam [channel_id] [delay] <message>"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not ctx.bot.token_pool:
+                await ctx.send(" No tokens loaded. Use `.host <token>` first.")
+                return
+            
+            target_channel_id = channel_id or ctx.channel.id
+            if channel_id and not ctx.bot.get_channel(channel_id):
+                await ctx.send(" Invalid channel ID!")
+                return
+            
+            if not message:
+                await ctx.send(" Usage: `.multistam [channel_id] [delay] <message>`")
+                return
+            
+            # Cancel existing tasks
+            if hasattr(ctx.bot, 'multistam_tasks'):
+                for alias, task in list(ctx.bot.multistam_tasks.items()):
+                    if not task.done():
+                        task.cancel()
+            ctx.bot.multistam_tasks = {}
+            
+            async def stam_worker(token_info, channel_id, alias, msg, delay):
+                token = token_info["token"]
+                proxy = get_random_proxy()
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+                
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        # Verify token
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                            if resp.status != 200:
+                                print(f"[MultiStam] {alias} token invalid: HTTP {resp.status}")
+                                return
+                            user_data = await resp.json()
+                            print(f"[MultiStam] {alias} authenticated as {user_data['username']}")
+                        
+                        # Main loop - send message with counter
+                        counter = 1
+                        while True:
+                            await asyncio.sleep(0.1)
+                            
+                            # Add counter to message
+                            msg_with_count = f"{msg} ({counter})"
+                            payload = {"content": msg_with_count}
+                            
+                            try:
+                                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                    if resp.status in (200, 204):
+                                        pass
+                                    else:
+                                        print(f"[MultiStam] {alias} send failed: {resp.status}")
+                                        await asyncio.sleep(5)
+                            except Exception as e:
+                                print(f"[MultiStam] {alias} error: {e}")
+                                await asyncio.sleep(5)
+                            
+                            counter += 1
+                            await asyncio.sleep(delay)
+                            
+                    except asyncio.CancelledError:
+                        print(f"[MultiStam] {alias} task cancelled")
+                    except Exception as e:
+                        print(f"[MultiStam] {alias} error: {e}")
+            
+            # Start workers
+            for token_info in ctx.bot.token_pool:
+                alias = token_info.get("alias", "unknown")
+                task = asyncio.create_task(stam_worker(token_info, target_channel_id, alias, message, delay))
+                ctx.bot.multistam_tasks[alias] = task
+                await asyncio.sleep(0.5)
+            
+            await ctx.send(f" MultiStam started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}> with {delay}s delay")
+        
+        # ========== STOP MULTISTAM ==========
+        @self.command(name='stopmultistam')
+        async def stopmultistam(ctx):
+            """Stop all multi-stam tasks"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not hasattr(ctx.bot, 'multistam_tasks') or not ctx.bot.multistam_tasks:
+                await ctx.send(" No active multistam tasks.")
+                return
+            
+            count = 0
+            for alias, task in list(ctx.bot.multistam_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            ctx.bot.multistam_tasks.clear()
+            
+            await ctx.send(f" Stopped {count} multistam task(s).")
+
+        # ========== MULTICOUNT ==========
+        @self.command(name='multicount')
+        async def multicount(ctx, channel_id: int = None, start: int = 1, stop: int = 100):
+            """Count from all hosted tokens - .multicount [channel_id] <start> <stop>"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not ctx.bot.token_pool:
+                await ctx.send(" No tokens loaded. Use `.host <token>` first.")
+                return
+            
+            target_channel_id = channel_id or ctx.channel.id
+            if channel_id and not ctx.bot.get_channel(channel_id):
+                await ctx.send(" Invalid channel ID!")
+                return
+            
+            if start > stop:
+                await ctx.send(" Start value must be less than stop value.")
+                return
+            
+            # Cancel existing tasks
+            if hasattr(ctx.bot, 'multicount_tasks'):
+                for alias, task in list(ctx.bot.multicount_tasks.items()):
+                    if not task.done():
+                        task.cancel()
+            ctx.bot.multicount_tasks = {}
+            
+            async def count_worker(token_info, channel_id, alias, start_num, stop_num, token_index, total_tokens):
+                token = token_info["token"]
+                proxy = get_random_proxy()
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+                
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        # Verify token
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                            if resp.status != 200:
+                                print(f"[MultiCount] {alias} token invalid: HTTP {resp.status}")
+                                return
+                            user_data = await resp.json()
+                            print(f"[MultiCount] {alias} authenticated as {user_data['username']}")
+                        
+                        # Each token starts from a different number
+                        # Token 1: 1, 4, 7, 10...
+                        # Token 2: 2, 5, 8, 11...
+                        # Token 3: 3, 6, 9, 12...
+                        offset = token_index  # 0-based index
+                        step = total_tokens
+                        
+                        current = start_num + offset
+                        
+                        while current <= stop_num:
+                            await asyncio.sleep(0.1)
+                            
+                            payload = {"content": str(current)}
+                            
+                            try:
+                                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                    if resp.status in (200, 204):
+                                        pass
+                                    else:
+                                        print(f"[MultiCount] {alias} send failed: {resp.status}")
+                                        await asyncio.sleep(3)
+                            except Exception as e:
+                                print(f"[MultiCount] {alias} error: {e}")
+                                await asyncio.sleep(3)
+                            
+                            current += step
+                            await asyncio.sleep(0.8)  # Delay between numbers
+                            
+                    except asyncio.CancelledError:
+                        print(f"[MultiCount] {alias} task cancelled")
+                    except Exception as e:
+                        print(f"[MultiCount] {alias} error: {e}")
+            
+            # Start workers with staggered numbering
+            total_tokens = len(ctx.bot.token_pool)
+            for i, token_info in enumerate(ctx.bot.token_pool):
+                alias = token_info.get("alias", "unknown")
+                task = asyncio.create_task(count_worker(token_info, target_channel_id, alias, start, stop, i, total_tokens))
+                ctx.bot.multicount_tasks[alias] = task
+                await asyncio.sleep(0.3)
+            
+            await ctx.send(f" MultiCount started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}> from {start} to {stop}")
+        
+        # ========== STOP MULTICOUNT ==========
+        @self.command(name='stopmulticount')
+        async def stopmulticount(ctx):
+            """Stop all multi-count tasks"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            if not hasattr(ctx.bot, 'multicount_tasks') or not ctx.bot.multicount_tasks:
+                await ctx.send(" No active multicount tasks.")
+                return
+            
+            count = 0
+            for alias, task in list(ctx.bot.multicount_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            ctx.bot.multicount_tasks.clear()
+            
+            await ctx.send(f" Stopped {count} multicount task(s).")
         
         # ========== SNIPE ==========
         @self.command(name='snipeset')
