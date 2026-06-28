@@ -2098,10 +2098,17 @@ class SupremeBot(commands.Bot):
                 (".uptime", "", "Show bot uptime", "yellow"),
                 (".date", "", "Show current date", "yellow"),
                 
-                #  PAGE 15 - YELLOW (Menu & Navigation)
-                (".menu", "", "Show this menu", "yellow"),
-                (".n", "", "Next menu page", "yellow"),
-                (".p", "", "Previous menu page", "yellow"),
+                #  PAGE 15 - YELLOW (multi cmd)
+                (".multireact", "<channel_id> <emoji1> <emoji2>", "React with all tokens", "yellow"),
+                (".stopmultireact", "", "Stop all multireact", "yellow"),
+                (".multistam", "<channel_id> <delay> <msg>", "Stam with all tokens", "yellow"),
+                (".stopmultistam", "", "Stop all multistam", "yellow"),
+
+                # PAGE 16 - PURPLE (multi cmd 2)
+                (".multicount", "<channel_id> <start> <stop>", "Count with all tokens", "purple"),
+                (".stopmulticount", "", "Stop all multicount", "purple"),
+                (".multistream", "s,u,p,r,e,m,e", "Multiple streams at once", "purple"),
+                (".stopmultistream", "", "Stop multi-streaming", "purple"),
             ]
             
             per_page = 4
@@ -2129,6 +2136,7 @@ class SupremeBot(commands.Bot):
                 "orange": "\u001b[38;5;214m",
                 "yellow": "\u001b[1;33m",
                 "white": "\u001b[1;37m",
+                "purple": "\u001b[38;5;129m",
             }
 
             # Command entries
