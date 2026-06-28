@@ -1,4 +1,5 @@
 import discord
+from discord.ext import commands
 import asyncio
 import random
 import os
@@ -15,48 +16,11 @@ TOKEN = os.getenv("TOKEN") # Your main Discord user token
 if not TOKEN:
     print(" TOKEN environment variable not set.")
     exit(1)
-GROQ_API_KEY = "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"  # Replace with your Groq key
+GROQ_API_KEY = "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" # groq api key
 
-# ========== GLOBAL VARIABLES ==========
-client = discord.Client()
-start_time = time.time()
-tasks = {}                # channel_id -> scheduler task
-typing_task = None
-status_task = None
-name_task = None
-spam_tasks = []
-afk_task = None
-wordlists = {}            # name -> list of lines
-autopaste_msgs = {}       # channel_id -> list of (delay, message)
-stam_msgs = {}            # channel_id -> list of (delay, message)
-count_tasks = {}          # channel_id -> asyncio.Task
-react_task = None
-stream_task = None
-auto_reply_tasks = {}     # user_id -> asyncio.Task
-gc_task = None
-token_pool = []           # list of {"token": str, "client": discord.Client?, "user": object}
-main_user_id = None
-tool_channel_id = None
-anti_target_channel = None
-anti_user_history = {}    # user_id -> deque of (content, message)
-anti_user_last_number = {}
-anti_replied_instruction = set()
-BEEF_WORDS = []            # loaded from beef.txt if exists
-aball_tasks = {}          # alias -> asyncio.Task for beef workers
-react_tasks = {}   # alias -> asyncio.Task for auto-reactions
-mimic_tasks = {}   # alias -> asyncio.Task for message mimic
-mimic_enabled = False   # global flag for mimic mode
-reaction_emojis = []   # list of emojis to react with
-ar_replied_ids = {}   # user_id -> set of message IDs already replied to
-pending_import = {}   # user_id -> wordlist name
-deleted_cache = {}
-snipe_enabled = set()
-spamall_tasks = {}          # alias -> asyncio.Task for spam workers
-spamall_interval = 2        # seconds between messages (default, adjustable via command)
-PERSISTENT_SPAM_FILE = "spam_state.json"
-persistent_spam_tasks = {}
-hosted_clients = {}  # token -> discord.Client instance
-hosted_tasks = {}    # token -> asyncio.Task
+# ========== GLOBAL REGISTRY ==========
+hosted_bots = []
+hosted_bots_set = set()
 
 # ========== LOAD / SAVE HELPERS ==========
 async def load_lines_async(file_path):
@@ -90,26 +54,21 @@ def get_random_proxy():
 def save_wordlist(name, lines):
     with open(f"wordlist_{name}.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    wordlists[name] = lines
 
 def extract_target_channel(content, guild):
-    """Extract channel from message like 'reply in #channel', 'reply in general', or 'reply in txt 4'"""
     if not guild:
         return None
     
-    # Pattern 1: Channel mention <#123456789>
     match = re.search(r'(?:reply|tell|say|answer|send)\s+in\s+<#(\d+)>', content, re.IGNORECASE)
     if match:
         channel_id = int(match.group(1))
         return guild.get_channel(channel_id)
     
-    # Pattern 2: Channel ID (just numbers)
     match = re.search(r'(?:reply|say|tell|answer|send)\s+in\s+(\d+)', content, re.IGNORECASE)
     if match:
         channel_id = int(match.group(1))
         return guild.get_channel(channel_id)
     
-    # Pattern 3: Channel name with # (e.g., "#general")
     match = re.search(r'(?:reply|say|tell|answer|send)\s+in\s+#(\S+)', content, re.IGNORECASE)
     if match:
         channel_name = match.group(1).lower()
@@ -117,23 +76,19 @@ def extract_target_channel(content, guild):
             if channel.name.lower() == channel_name:
                 return channel
     
-    # Pattern 4: Channel name without # (e.g., "general" or "txt 4")
     match = re.search(r'(?:reply|say|tell|answer|send)\s+in\s+(.+?)(?:\s+[\w]+|$)', content, re.IGNORECASE)
     if match:
         channel_name = match.group(1).strip().lower()
-        # Try exact match first
         for channel in guild.channels:
             if channel.name.lower() == channel_name:
                 return channel
         
-        # Try matching ignoring spaces vs dashes (e.g., "txt-4" vs "txt 4")
         normalized_query = channel_name.replace(' ', '-').replace('_', '-')
         for channel in guild.channels:
             normalized_name = channel.name.lower().replace(' ', '-').replace('_', '-')
             if normalized_query == normalized_name:
                 return channel
         
-        # Try checking if channel name contains all words from query
         query_words = set(channel_name.split())
         for channel in guild.channels:
             name_words = set(channel.name.lower().split())
@@ -246,1994 +201,1506 @@ Respond with only the pack message, no extra text."""
             temperature=0.9, max_tokens=100
         )
         return resp.choices[0].message.content.strip()
-    except:
+    except Exception as e:
         print(f"[Pack Generator Error] {e}")
         return "error"
 
-# ========== NUKE FUNCTION ==========
-async def nuke_server(guild_id, new_name="captured by supreme", description="This server has been taken", channel_prefix="fucked-", channel_count=10):
-    guild = client.get_guild(guild_id)
-    if not guild:
-        return "Server not found"
-    try:
-        await guild.edit(name=new_name, description=description)
-        # Delete all channels
-        for ch in guild.channels:
-            try:
-                await ch.delete()
-                await asyncio.sleep(0.3)
-            except: pass
-        # Create new channels
-        for i in range(channel_count):
-            await guild.create_text_channel(f"{channel_prefix}{i+1}")
-            await asyncio.sleep(0.5)
-        return f"Nuked {guild.name}"
-    except Exception as e:
-        return f"Nuke failed: {e}"
-
-# ========== RESILIENT SPAM LOOP ==========
-async def resilient_spam_loop(channel_id, message, delay=6):
-    """Spam loop that auto-recovers from mutes, kicks, and rate limits"""
-    while True:
-        try:
-            channel = client.get_channel(channel_id)
-            if channel:
-                await channel.send(message)
-            else:
-                print(f"[Spam] Channel {channel_id} not found, retrying...")
-                await asyncio.sleep(30)
-                continue
-        except discord.errors.Forbidden:
-            print("[Spam] Muted or forbidden, waiting 60s...")
-            await asyncio.sleep(60)
-            continue
-        except discord.errors.HTTPException as e:
-            if "rate limited" in str(e).lower():
-                print("[Spam] Rate limited, waiting 30s...")
-                await asyncio.sleep(30)
-                continue
-            print(f"[Spam] HTTP error: {e}")
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"[Spam] Error: {e}")
-            await asyncio.sleep(10)
-        await asyncio.sleep(delay)
-
-async def save_spam_state(channel_id, message, delay):
-    """Save spam state to file for recovery after restart"""
-    try:
-        with open(PERSISTENT_SPAM_FILE, "r") as f:
-            state = json.load(f)
-    except:
-        state = {}
-    
-    state[str(channel_id)] = {"message": message, "delay": delay}
-    with open(PERSISTENT_SPAM_FILE, "w") as f:
-        json.dump(state, f)
-
-async def restore_spam_state():
-    """Restore spam state after reconnect/restart"""
-    try:
-        with open(PERSISTENT_SPAM_FILE, "r") as f:
-            state = json.load(f)
-        for channel_id, data in state.items():
-            channel_id = int(channel_id)
-            task = asyncio.create_task(resilient_spam_loop(channel_id, data["message"], data["delay"]))
-            persistent_spam_tasks[channel_id] = task
-            print(f"[Restore] Restored spam for channel {channel_id}")
-    except:
-        pass
-
-# ========== COMMAND HANDLER ==========
-@client.event
-async def on_ready():
-    global main_user_id
-    main_user_id = client.user.id
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
-    print("Type .menu to see all commands")
-
-    hosted_clients.clear()
-    hosted_tasks.clear()
-    print("[HostAll] Cleared stale hosted client data.")
-
-@client.event
-async def on_message_delete(message):
-    # only work if enabled in this channel
-    if message.channel.id not in snipe_enabled:
-        return
-
-    data = deleted_cache.get(message.id)
-
-    if not data:
-        return
-
-    try:
-        await message.channel.send(
-            f" **this guy deleted Message**\n"
-            f" sender: {data['author']}\n"
-            f" Sent at: {data['time']}\n"
-            f" message: {data['content']}"
-        )
-    except:
-        pass
-
-@client.event
-async def on_guild_remove(guild):
-    """Auto-rejoin when kicked from a server using stored invite links"""
-    # Load saved invites from a file
-    try:
-        with open("saved_invites.json", "r") as f:
-            saved_invites = json.load(f)
-    except:
-        saved_invites = {}
-    
-    if str(guild.id) in saved_invites:
-        invite_code = saved_invites[str(guild.id)]
-        # Attempt to rejoin
-        try:
-            invite = await client.fetch_invite(invite_code)
-            await invite.accept()
-            print(f"[Auto-Rejoin] Rejoined {guild.name}")
-        except:
-            print(f"[Auto-Rejoin] Failed to rejoin {guild.name} - invite expired")
-
-@client.event
-async def on_message(message):
-    global anti_target_channel, anti_user_history, anti_user_last_number, tasks
-    global status_task, name_task, spam_tasks, afk_task, autopaste_msgs, stam_msgs
-    global count_tasks, react_task, stream_task, auto_reply_tasks, gc_task, token_pool
-    global BEEF_WORDS, main_user_id, tool_channel_id, current_menu_page, reaction_emojis
-
-        # store message info
-    deleted_cache[message.id] = {
-        "content": message.content,
-        "author": f"{message.author} ({message.author.id})",
-        "time": message.created_at.strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    authorized_ids = {client.user.id}   # always allow the main account
-    for token_info in token_pool:
-        if token_info.get('user_id'):
-            authorized_ids.add(token_info['user_id'])
+# ========== SUPREME TOOL CLASS ==========
+class SupremeBot(commands.Bot):
+    def __init__(self, token, command_prefix=".", **options):
+        super().__init__(command_prefix=command_prefix, self_bot=True, **options)
+        self.token = token
+        self.current_page = 1  
         
-
-    # ----- Command processing only for authorized users -----
-    if message.author.id not in authorized_ids:
-        return
-    
-    if not message.content.startswith("."):
-        return
-
-    # ====== Process commands using the shared handler ======
-    await handle_command(message, client)
-      
-async def handle_command(message, client_instance):
-    # ONLY process if the message author is the client itself
-    if message.author.id != client_instance.user.id:
-        return
-    global anti_target_channel, anti_user_history, anti_user_last_number, tasks
-    global status_task, name_task, spam_tasks, afk_task, autopaste_msgs, stam_msgs
-    global count_tasks, react_task, stream_task, auto_reply_tasks, gc_task, token_pool
-    global BEEF_WORDS, main_user_id, tool_channel_id, current_menu_page, reaction_emojis
-
-        # store message info
-    deleted_cache[message.id] = {
-        "content": message.content,
-        "author": f"{message.author} ({message.author.id})",
-        "time": message.created_at.strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    authorized_ids = {client_instance.user.id}   # allow the current client's user
-    for token_info in token_pool:
-        if token_info.get('user_id'):
-            authorized_ids.add(token_info['user_id'])
-    
-# ----- Anti AFK logic (works for ANY user in monitored channel) -----
-    if anti_target_channel and message.channel.id == anti_target_channel:
-        author_id = message.author.id
-        content = message.content
-        if author_id not in anti_user_history:
-            anti_user_history[author_id] = deque(maxlen=10)
-        anti_user_history[author_id].append((content, message))
-        # Check for "tell my alias" (handled separately, not by Groq)
-        if re.search(r'(?:tell|whats?|what is)\s+my\s+alias', content.lower()):
-            if message.guild:
-                member = message.guild.get_member(author_id)
-                alias = member.nick if member and member.nick else message.author.name
-            else:
-                alias = message.author.name
-            target_channel = extract_target_channel(content, message.guild)
-            if target_channel:
-                await target_channel.send(f"# {alias}")
-            else:
-                await message.channel.send(f"# {alias}")
-            return
-        num = parse_count_number(content)
-        if num is not None:
-            last = anti_user_last_number.get(author_id, 0)
-            if num == last + 1:
-                anti_user_last_number[author_id] = num
-                if num == 9:
-                    history = list(anti_user_history.get(author_id, []))
-                    answer = None
-                    for prev_content, _ in reversed(history):
-                        if prev_content == content: continue
-                        ans = extract_answer(prev_content)
-                        if ans:
-                            answer = ans
-                            break
-                    if answer:
-                        target_channel = extract_target_channel(content, message.guild)
-                        if target_channel:
-                            await target_channel.send(f"# {answer}")
-                        else:
-                            await message.channel.send(f"# {answer}")
-                        print(f"Anti AFK replied: {answer}")
-                    anti_user_last_number[author_id] = 0
-            else:
-                anti_user_last_number[author_id] = 0
-        else:
-            anti_user_last_number[author_id] = 0
+        # Per-bot state
+        self.tasks = {}
+        self.spam_tasks = []
+        self.reaction_emojis = []
+        self.auto_reply_tasks = {}
+        self.ar_replied_ids = {}
+        self.wordlists = {}
+        self.BEEF_WORDS = []
+        self.aball_tasks = {}
+        self.react_tasks = {}
+        self.mimic_tasks = {}
+        self.mimic_enabled = False
+        self.spamall_tasks = {}
+        self.pending_import = {}
+        self.deleted_cache = {}
+        self.snipe_enabled = set()
+        self.start_time = time.time()
+        self.name_task = None
+        self.afk_task = None
+        self.stream_task = None
+        self.gc_task = None
+        self.anti_target_channel = None
+        self.anti_user_history = {}
+        self.anti_user_last_number = {}
+        self.count_tasks = {}
+        self.autopaste_msgs = {}
+        self.stam_msgs = {}
+        self.persistent_spam_tasks = {}
+        self.PERSISTENT_SPAM_FILE = "spam_state.json"
+        self.token_pool = []
         
+    async def setup_hook(self):
+        """Called automatically when the bot is ready to set up commands"""
+        self._register_events()
+        self._register_commands()
 
-        # ----- Auto-reaction (instant) -----
-    if message.author == client_instance.user and reaction_emojis:
-        # React to your own messages immediately
-        for emoji in reaction_emojis:
-            try:
-                await message.add_reaction(emoji)
-                await asyncio.sleep(0.2)  # tiny delay between reactions to avoid rate limits
-            except:
-                pass
+    def _register_events(self):
+        @self.event
+        async def on_ready():
+            print(f" Logged in as: {self.user} (ID: {self.user.id})")
+            print(f" Prefix: {self.command_prefix}")
+            print("Type .menu to see all commands")
+        
+        @self.event
+        async def on_message(message):
 
-    # ----- Command processing only for authorized users -----
-    if message.author.id not in authorized_ids:
-        return
-
-    # ----- Handle file uploads for pending imports -----
-    if message.attachments and message.author.id in pending_import:
-        name = pending_import.pop(message.author.id)
-        attachment = message.attachments[0]
-        if not attachment.filename.endswith('.txt'):
-            await message.channel.send(f" Only `.txt` files are allowed for wordlists.")
-            return
-        try:
-            # Download the file content
-            async with aiohttp.ClientSession() as session:
-                async with session.get(attachment.url) as resp:
-                    if resp.status == 200:
-                        content = await resp.text()
-                        lines = [l.strip() for l in content.splitlines() if l.strip()]
-                        if not lines:
-                            await message.channel.send(f" File is empty.")
-                            return
-                        # Save as wordlist_<name>.txt
-                        filename = f"{name}.txt"
-                        with open(filename, "w", encoding="utf-8") as f:
-                            f.write("\n".join(lines))
-                        wordlists[name] = lines
-                        await message.channel.send(f" Wordlist **{name}** imported with {len(lines)} lines.")
-                    else:
-                        await message.channel.send(f" Failed to download file (HTTP {resp.status}).")
-        except Exception as e:
-            await message.channel.send(f" Error importing wordlist: {e}")
-        return  # Don't process the message as a command
-    
-    if not message.content.startswith("."):
-        return
-
-    parts = message.content.split()
-    cmd = parts[0].lower()
-    args = parts[1:]
-
-    # ========== ORIGINAL COMMANDS ==========
-    if cmd == ".ab" and len(args) == 3:
-        try:
-            ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
-            channel = client_instance.get_channel(ch_id)
-            if not channel:
-                await message.channel.send("Invalid channel ID")
-                return
-            if ch_id in tasks:
-                tasks[ch_id].cancel()
-            async def sched():
-                try:
-                    while True:
-                        if fname in wordlists:
-                            lines = wordlists[fname]
-                        else:
-                            lines = await asyncio.to_thread(load_lines, fname)
-                        await asyncio.sleep(0)   # cancellation point
-                        if not lines:
-                            await asyncio.sleep(5)
-                            continue
-                        random.shuffle(lines)
-                        for line in lines:
-                            # Check for cancellation before each send
-                            if asyncio.current_task().cancelled():
-                                return
-                            try:
-                                await channel.send(line)
-                                await asyncio.sleep(delay)
-                            except asyncio.CancelledError:
-                                raise
-                            except:
-                                await asyncio.sleep(5)
-                except asyncio.CancelledError:
-                    return
-
-            tasks[ch_id] = asyncio.create_task(sched())
+            # Store message in cache for snipe
+            self.deleted_cache[message.id] = {
+                "content": message.content,
+                "author": f"{message.author} ({message.author.id})",
+                "time": message.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            }
             
-            await message.channel.send(f"ab started in {ch_id} every {delay}s using {fname}")
-        except:
-            await message.channel.send("Usage: .ab <channel_id> <delay> <file.txt>")
-    
-    elif cmd == ".abstop":
-        if not tasks:
-            await message.channel.send("No active ab running")
-            return
-        count = 0
-        for ch_id, task in list(tasks.items()):
-            if not task.done():
-                task.cancel()
-                count += 1
-        tasks.clear()
-        await message.channel.send(f" Stopped {count} ab(s).")
-
-    elif cmd == ".startnames" and len(args) >= 1:
-        names = [n.strip() for n in message.content[12:].split(",") if n.strip()]
-        if not names:
-            await message.channel.send("Provide names: .startnames name1,name2,...")
-            return
-        async def cycle():
-            count = 0
-            while count < 500000:
-                for name in names:
+            #  Auto-reaction to your own messages
+            if message.author == self.user and self.reaction_emojis:
+                for emoji in self.reaction_emojis:
                     try:
-                        await message.channel.edit(name=name)
-                        await asyncio.sleep(1)
-                        count += 1
-                        if count >= 500000: break
+                        await message.add_reaction(emoji)
+                        await asyncio.sleep(0.2)
                     except:
-                        await asyncio.sleep(60)
-        if name_task: name_task.cancel()
-        name_task = asyncio.create_task(cycle())
-        await message.channel.send("Name cycling started")
+                        pass
 
-    elif cmd == ".stopnames":
-        if name_task:
-            name_task.cancel()
-            name_task = None
-            await message.channel.send("Name cycling stopped")
+            authorized_ids = {self.user.id}
+            for token_info in self.token_pool:
+                if token_info.get('user_id'):
+                    authorized_ids.add(token_info['user_id'])
 
-    elif cmd == ".spam":
-        spam_msg = message.content[6:]
-        if not spam_msg:
-            await message.channel.send("Usage: .spam <message>")
-            return
+            if message.author.id in authorized_ids:
+                await self.process_commands(message)
+
+        @self.event
+        async def on_message_delete(message):
+            """Handle deleted messages for snipe"""
+            # Check if snipe is enabled in this channel
+            if message.channel.id not in self.snipe_enabled:
+                return
+            
+            # Get cached message data
+            data = self.deleted_cache.get(message.id)
+            if not data:
+                return
+            
+            # Send snipe message
+            try:
+                snipe_msg = f"**Deleted Message**\n"
+                snipe_msg += f"**Author:** {data['author']}\n"
+                snipe_msg += f"**Time:** {data['time']}\n"
+                snipe_msg += f"**Content:** {data['content']}"
+                
+                await message.channel.send(snipe_msg)
+                
+                # Remove from cache after sending
+                if message.id in self.deleted_cache:
+                    del self.deleted_cache[message.id]
+            except Exception as e:
+                print(f"[Snipe Error] {e}")
         
-        delay = 6  # default delay
-        # Check if user specified a delay: .spam <delay> <message>
-        parts = message.content.split()
-        if len(parts) >= 3 and parts[1].replace('.', '').isdigit():
-            delay = float(parts[1])
-            spam_msg = " ".join(parts[2:])
+    def _register_commands(self):
+        # ========== AB ==========
+        @self.command(name='ab')
+        async def ab(ctx, channel_id: int, delay: float, wordlist: str):
+            try:
+                channel = ctx.bot.get_channel(channel_id)
+                if not channel:
+                    await ctx.send("Invalid channel ID")
+                    return
+                if channel_id in ctx.bot.tasks:
+                    ctx.bot.tasks[channel_id].cancel()
+                
+                async def sched():
+                    try:
+                        while True:
+                            if wordlist in ctx.bot.wordlists:
+                                lines = ctx.bot.wordlists[wordlist]
+                            else:
+                                lines = await asyncio.to_thread(load_lines, wordlist)
+                            await asyncio.sleep(0)
+                            if not lines:
+                                await asyncio.sleep(5)
+                                continue
+                            random.shuffle(lines)
+                            for line in lines:
+                                if asyncio.current_task().cancelled():
+                                    return
+                                try:
+                                    await channel.send(line)
+                                    await asyncio.sleep(delay)
+                                except asyncio.CancelledError:
+                                    raise
+                                except:
+                                    await asyncio.sleep(5)
+                    except asyncio.CancelledError:
+                        return
+                
+                ctx.bot.tasks[channel_id] = asyncio.create_task(sched())
+                await ctx.send(f"ab started in {channel_id} every {delay}s using {wordlist}")
+            except:
+                await ctx.send("Usage: .ab <channel_id> <delay> <file.txt>")
         
-        async def sp():
-            while True:
-                try:
-                    # Check if channel still exists
-                    ch = message.channel
-                    if not ch:
-                        # Channel might be deleted, try to find by ID
-                        ch = client_instance.get_channel(message.channel.id)
+        @self.command(name='abstop')
+        async def abstop(ctx):
+            if not ctx.bot.tasks:
+                await ctx.send("No active ab running")
+                return
+            count = 0
+            for ch_id, task in list(ctx.bot.tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            ctx.bot.tasks.clear()
+            await ctx.send(f"Stopped {count} ab(s).")
+        
+        @self.command(name='ablow')
+        async def ablow(ctx, channel_id: int, delay: float, wordlist: str):
+            """Auto-beef in lowercase"""
+            try:
+                channel = ctx.bot.get_channel(channel_id)
+                if not channel:
+                    await ctx.send("Invalid channel ID")
+                    return
+                if channel_id in ctx.bot.tasks:
+                    ctx.bot.tasks[channel_id].cancel()
+                
+                async def sched_lower():
+                    try:
+                        while True:
+                            if wordlist in ctx.bot.wordlists:
+                                lines = ctx.bot.wordlists[wordlist]
+                            else:
+                                lines = await asyncio.to_thread(load_lines, wordlist)
+                            await asyncio.sleep(0)
+                            if not lines:
+                                await asyncio.sleep(5)
+                                continue
+                            random.shuffle(lines)
+                            for line in lines:
+                                if asyncio.current_task().cancelled():
+                                    return
+                                try:
+                                    await channel.send(line.lower())
+                                    await asyncio.sleep(delay)
+                                except asyncio.CancelledError:
+                                    raise
+                                except:
+                                    await asyncio.sleep(5)
+                    except asyncio.CancelledError:
+                        return
+                
+                ctx.bot.tasks[channel_id] = asyncio.create_task(sched_lower())
+                await ctx.send(f"ablow started in {channel_id} every {delay}s using {wordlist} (lowercase)")
+            except:
+                await ctx.send("Usage: .ablow <channel_id> <delay> <file.txt>")
+        
+        # ========== SPAM ==========
+        @self.command(name='spam')
+        async def spam(ctx, *, message: str):
+            if not message:
+                await ctx.send("Usage: .spam <message>")
+                return
+            
+            parts = message.split()
+            delay = 6
+            spam_msg = message
+            if len(parts) >= 2 and parts[0].replace('.', '').isdigit():
+                delay = float(parts[0])
+                spam_msg = " ".join(parts[1:])
+            
+            async def sp():
+                while True:
+                    try:
+                        ch = ctx.channel
                         if not ch:
-                            print(f"[Spam] Channel {message.channel.id} not found, retrying...")
+                            ch = ctx.bot.get_channel(ctx.channel.id)
+                            if not ch:
+                                await asyncio.sleep(30)
+                                continue
+                        await ch.send(spam_msg)
+                    except discord.errors.Forbidden:
+                        await asyncio.sleep(60)
+                        continue
+                    except discord.errors.HTTPException as e:
+                        if "rate limited" in str(e).lower():
                             await asyncio.sleep(30)
                             continue
-                    
-                    await ch.send(spam_msg)
-                except discord.errors.Forbidden:
-                    print("[Spam] Muted or no permissions, waiting 60s...")
-                    await asyncio.sleep(60)
-                    continue
-                except discord.errors.HTTPException as e:
-                    if "rate limited" in str(e).lower():
-                        print("[Spam] Rate limited, waiting 30s...")
-                        await asyncio.sleep(30)
-                        continue
-                    print(f"[Spam] HTTP error: {e}")
-                    await asyncio.sleep(10)
-                except asyncio.CancelledError:
-                    print("Spam task cancelled")
-                    break
-                except Exception as e:
-                    print(f"[Spam] Error: {e}")
-                    await asyncio.sleep(10)
-                await asyncio.sleep(delay)
+                        await asyncio.sleep(10)
+                    except asyncio.CancelledError:
+                        break
+                    except:
+                        await asyncio.sleep(10)
+                    await asyncio.sleep(delay)
+            
+            for task in ctx.bot.spam_tasks[:]:
+                if not task.done():
+                    task.cancel()
+            ctx.bot.spam_tasks.clear()
+            
+            task = asyncio.create_task(sp())
+            ctx.bot.spam_tasks.append(task)
+            await ctx.send(f"Resilient spam started (delay: {delay}s)")
         
-        # Cancel existing spam task for this channel
-        for task in spam_tasks[:]:
-            if not task.done():
-                task.cancel()
-        spam_tasks.clear()
+        @self.command(name='stopspam')
+        async def stopspam(ctx):
+            if not ctx.bot.spam_tasks:
+                await ctx.send("No active spam tasks.")
+                return
+            count = 0
+            for task in ctx.bot.spam_tasks:
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            await asyncio.sleep(0.1)
+            ctx.bot.spam_tasks.clear()
+            await ctx.send(f"Stopped {count} spam task(s).")
         
-        task = asyncio.create_task(sp())
-        spam_tasks.append(task)
+        # ========== REACT ==========
+        @self.command(name='react')
+        async def react(ctx, *, emojis: str):
+            ctx.bot.reaction_emojis = emojis.split()
+            await ctx.send(f"Auto-react enabled with: {' '.join(ctx.bot.reaction_emojis)}")
         
-        # Save state for recovery
-        await save_spam_state(message.channel.id, spam_msg, delay)
-        await message.channel.send(f" Resilient spam started (delay: {delay}s)")
-    
-    elif cmd == ".stopspam":
-        if not spam_tasks:
-            await message.channel.send("No active spam tasks.")
-            return
+        @self.command(name='stopreact')
+        async def stopreact(ctx):
+            ctx.bot.reaction_emojis = []
+            await ctx.send("Auto-react stopped")
         
-        count = 0
-        for task in spam_tasks:
-            if not task.done():
-                task.cancel()
-                count += 1
-
-        await asyncio.sleep(0.1)
-        
-        spam_tasks.clear()
-        await message.channel.send(f" Stopped {count} spam task(s).")
-
-    elif cmd == ".mentioncheck" and len(args) >= 2 and message.mentions:
-        user = message.mentions[0]
-        try:
-            limit = int(args[-1])
-        except:
-            await message.channel.send("Enter a valid number")
-            return
-        async def afk():
-            for i in range(1, limit+1):
+        # ========== STREAM ==========
+        @self.command(name='stream')
+        async def stream(ctx, *, texts: str):
+            if ctx.bot.stream_task:
+                ctx.bot.stream_task.cancel()
+            
+            text_list = [t.strip() for t in texts.split(",")]
+            async def stream_loop():
                 try:
-                    await message.channel.send(f"{user.mention} {i}")
-                    await asyncio.sleep(2)
-                except:
-                    await asyncio.sleep(5)
-        if afk_task: afk_task.cancel()
-        afk_task = asyncio.create_task(afk())
-        await message.channel.send(f"AFK check started for {user}")
-
-    elif cmd == ".stopafk":
-        if afk_task:
-            afk_task.cancel()
-            afk_task = None
-            await message.channel.send("AFK check stopped")
-
-    # ========== NEW COMMANDS ==========
-    elif cmd == ".menu":
-        # pagination will be handled by separate commands .n and .p
-        await show_menu_page(message.channel, 0)
-
-    elif cmd == ".n":
-        await next_menu_page(message.channel)
-
-    elif cmd == ".p":
-        await prev_menu_page(message.channel)
-
-    elif cmd == ".wordlist" and len(args) == 1:
-        name = args[0]
-        base = name if not name.endswith('.txt') else name[:-4]
-        lines = load_lines(f"{base}.txt")
-        if lines:
-            wordlists[name] = lines
-            await message.channel.send(f"Loaded wordlist '{name}' with {len(lines)} lines")
-        else:
-            await message.channel.send(f"Wordlist '{name}' not found")
-
-    elif cmd == ".wordlists":
-        txt_files = [f for f in os.listdir() if f.endswith('.txt') and os.path.isfile(f)]
-        if txt_files:
-            await message.channel.send(" .txt files in directory:\n" + "\n".join(txt_files))
-        else:
-            await message.channel.send("No .txt files found.")
-
-    elif cmd == ".importwl" and len(args) == 1:
-        name = args[0]
-        pending_import[client_instance.user.id] = name  # Use client_instance.user.id
-        await message.channel.send(f" upload the `.txt` file for wordlist **{name}** now (Send only the file, no extra text)")
-
-    elif cmd == ".autopaste" and len(args) >= 3:
-        try:
-            ch_id = int(args[0]); delay = float(args[1]); msg = " ".join(args[2:])
-            if ch_id not in autopaste_msgs:
-                autopaste_msgs[ch_id] = []
-            autopaste_msgs[ch_id].append((delay, msg))
-            # start background task if not already
-            if ch_id not in tasks:
+                    while True:
+                        for t in text_list:
+                            await ctx.bot.change_presence(activity=discord.Streaming(name=t, url="https://twitch.tv/yourchannel"))
+                            await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await ctx.bot.change_presence(activity=None)
+                    raise
+            ctx.bot.stream_task = asyncio.create_task(stream_loop())
+            await ctx.send(f"Streaming started: {', '.join(text_list)}")
+        
+        @self.command(name='streamend')
+        async def streamend(ctx):
+            if ctx.bot.stream_task:
+                ctx.bot.stream_task.cancel()
+                ctx.bot.stream_task = None
+                await ctx.bot.change_presence(activity=None)
+                await ctx.send("Streaming stopped")
+            else:
+                await ctx.send("No active stream task")
+        
+        # ========== AUTO-REPLY ==========
+        @self.command(name='ar')
+        async def ar(ctx, user: discord.User, channel_id: int, *, reply_msg: str):
+            if user.id in ctx.bot.auto_reply_tasks:
+                ctx.bot.auto_reply_tasks[user.id].cancel()
+            
+            if user.id not in ctx.bot.ar_replied_ids:
+                ctx.bot.ar_replied_ids[user.id] = set()
+            
+            async def ar_loop():
+                try:
+                    while True:
+                        try:
+                            ch = ctx.bot.get_channel(channel_id)
+                            if ch:
+                                async for msg in ch.history(limit=10):
+                                    if msg.author == user and msg.id not in ctx.bot.ar_replied_ids[user.id]:
+                                        await msg.reply(reply_msg)
+                                        ctx.bot.ar_replied_ids[user.id].add(msg.id)
+                                        if len(ctx.bot.ar_replied_ids[user.id]) > 100:
+                                            ctx.bot.ar_replied_ids[user.id].clear()
+                                        break
+                            await asyncio.sleep(2)
+                        except asyncio.CancelledError:
+                            break
+                        except:
+                            await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    if user.id in ctx.bot.ar_replied_ids:
+                        ctx.bot.ar_replied_ids[user.id].clear()
+            
+            task = asyncio.create_task(ar_loop())
+            ctx.bot.auto_reply_tasks[user.id] = task
+            await ctx.send(f"Auto-reply to {user} in <#{channel_id}>: \"{reply_msg[:50]}\"")
+        
+        @self.command(name='sar')
+        async def sar(ctx, user: discord.User = None):
+            if user is None:
+                for uid, task in list(ctx.bot.auto_reply_tasks.items()):
+                    if not task.done():
+                        task.cancel()
+                ctx.bot.auto_reply_tasks.clear()
+                ctx.bot.ar_replied_ids.clear()
+                await ctx.send("Stopped all auto-reply tasks.")
+            else:
+                if user.id in ctx.bot.auto_reply_tasks:
+                    ctx.bot.auto_reply_tasks[user.id].cancel()
+                    del ctx.bot.auto_reply_tasks[user.id]
+                    if user.id in ctx.bot.ar_replied_ids:
+                        del ctx.bot.ar_replied_ids[user.id]
+                    await ctx.send(f"Stopped auto-reply for {user}")
+                else:
+                    await ctx.send(f"No auto-reply for {user}")
+        
+        @self.command(name='ar2')
+        async def ar2(ctx, user: discord.User, lines: int, *, msg: str):
+            for _ in range(lines):
+                await ctx.send(f"{user.mention} {msg}")
+                await asyncio.sleep(0.5)
+            await ctx.send(f"Flood sent to {user}")
+        
+        # ========== WORDLIST ==========
+        @self.command(name='wordlist')
+        async def wordlist(ctx, name: str):
+            base = name if not name.endswith('.txt') else name[:-4]
+            lines = load_lines(f"{base}.txt")
+            if lines:
+                ctx.bot.wordlists[name] = lines
+                await ctx.send(f"Loaded wordlist '{name}' with {len(lines)} lines")
+            else:
+                await ctx.send(f"Wordlist '{name}' not found")
+        
+        @self.command(name='wordlists')
+        async def wordlists(ctx):
+            txt_files = [f for f in os.listdir() if f.endswith('.txt') and os.path.isfile(f)]
+            if txt_files:
+                await ctx.send(" .txt files in directory:\n" + "\n".join(txt_files))
+            else:
+                await ctx.send("No .txt files found.")
+        
+        @self.command(name='importwl')
+        async def importwl(ctx, name: str):
+            ctx.bot.pending_import[ctx.author.id] = name
+            await ctx.send(f"Upload the `.txt` file for wordlist **{name}** now (Send only the file, no extra text)")
+        
+        # ========== AUTOPASTE ==========
+        @self.command(name='autopaste')
+        async def autopaste(ctx, channel_id: int, delay: float, *, msg: str):
+            if channel_id not in ctx.bot.autopaste_msgs:
+                ctx.bot.autopaste_msgs[channel_id] = []
+            ctx.bot.autopaste_msgs[channel_id].append((delay, msg))
+            
+            if channel_id not in ctx.bot.tasks:
                 async def auto_paste_loop():
                     while True:
-                        if ch_id not in autopaste_msgs or not autopaste_msgs[ch_id]:
+                        if channel_id not in ctx.bot.autopaste_msgs or not ctx.bot.autopaste_msgs[channel_id]:
                             await asyncio.sleep(5)
                             continue
-                        for d, m in autopaste_msgs[ch_id]:
+                        for d, m in ctx.bot.autopaste_msgs[channel_id]:
                             try:
-                                ch = client_instance.get_channel(ch_id)
-                                if ch: await ch.send(m)
-                            except: pass
+                                ch = ctx.bot.get_channel(channel_id)
+                                if ch:
+                                    await ch.send(m)
+                            except:
+                                pass
                             await asyncio.sleep(d)
                         await asyncio.sleep(1)
-                tasks[ch_id] = asyncio.create_task(auto_paste_loop())
-            await message.channel.send(f"Auto-paste added in {ch_id}")
-        except:
-            await message.channel.send("Usage: .autopaste <channel_id> <delay> <message>")
-
-    elif cmd == ".autopastelist" and len(args) == 1:
-        ch_id = int(args[0])
-        if ch_id in autopaste_msgs:
-            msgs = "\n".join([f"{i+1}. delay={d} msg={m[:30]}" for i,(d,m) in enumerate(autopaste_msgs[ch_id])])
-            await message.channel.send(f"Auto-paste messages in {ch_id}:\n{msgs}")
-        else:
-            await message.channel.send("No auto-paste for that channel")
-
-    elif cmd == ".autopasteremove" and len(args) == 2:
-        ch_id = int(args[0]); idx = int(args[1]) - 1
-        if ch_id in autopaste_msgs and 0 <= idx < len(autopaste_msgs[ch_id]):
-            del autopaste_msgs[ch_id][idx]
-            await message.channel.send(f"Removed entry {idx+1}")
-        else:
-            await message.channel.send("Invalid index")
-
-    elif cmd == ".stopautopaste" and len(args) == 1:
-        ch_id = int(args[0])
-        if ch_id in tasks:
-            tasks[ch_id].cancel()
-            del tasks[ch_id]
-        autopaste_msgs.pop(ch_id, None)
-        await message.channel.send(f"Stopped auto-paste in {ch_id}")
-
-    # .stam similar to autopaste but with different name
-    elif cmd == ".stam" and len(args) >= 3:
-        # same as autopaste but store in stam_msgs
-        try:
-            ch_id = int(args[0]); delay = float(args[1]); msg = " ".join(args[2:])
-            if ch_id not in stam_msgs:
-                stam_msgs[ch_id] = []
-            stam_msgs[ch_id].append((delay, msg))
-            # start background task if not already
-            if f"stam_{ch_id}" not in tasks:
+                ctx.bot.tasks[channel_id] = asyncio.create_task(auto_paste_loop())
+            await ctx.send(f"Auto-paste added in {channel_id}")
+        
+        @self.command(name='autopastelist')
+        async def autopastelist(ctx, channel_id: int):
+            if channel_id in ctx.bot.autopaste_msgs:
+                msgs = "\n".join([f"{i+1}. delay={d} msg={m[:30]}" for i,(d,m) in enumerate(ctx.bot.autopaste_msgs[channel_id])])
+                await ctx.send(f"Auto-paste messages in {channel_id}:\n{msgs}")
+            else:
+                await ctx.send("No auto-paste for that channel")
+        
+        @self.command(name='autopasteremove')
+        async def autopasteremove(ctx, channel_id: int, index: int):
+            if channel_id in ctx.bot.autopaste_msgs and 0 <= index-1 < len(ctx.bot.autopaste_msgs[channel_id]):
+                del ctx.bot.autopaste_msgs[channel_id][index-1]
+                await ctx.send(f"Removed entry {index}")
+            else:
+                await ctx.send("Invalid index")
+        
+        @self.command(name='stopautopaste')
+        async def stopautopaste(ctx, channel_id: int):
+            if channel_id in ctx.bot.tasks:
+                ctx.bot.tasks[channel_id].cancel()
+                del ctx.bot.tasks[channel_id]
+            ctx.bot.autopaste_msgs.pop(channel_id, None)
+            await ctx.send(f"Stopped auto-paste in {channel_id}")
+        
+        # ========== STAM ==========
+        @self.command(name='stam')
+        async def stam(ctx, channel_id: int, delay: float, *, msg: str):
+            if channel_id not in ctx.bot.stam_msgs:
+                ctx.bot.stam_msgs[channel_id] = []
+            ctx.bot.stam_msgs[channel_id].append((delay, msg))
+            
+            if f"stam_{channel_id}" not in ctx.bot.tasks:
                 async def stam_loop():
                     while True:
-                        if ch_id not in stam_msgs or not stam_msgs[ch_id]:
+                        if channel_id not in ctx.bot.stam_msgs or not ctx.bot.stam_msgs[channel_id]:
                             await asyncio.sleep(5)
                             continue
-                        for d, m in stam_msgs[ch_id]:
+                        for d, m in ctx.bot.stam_msgs[channel_id]:
                             try:
-                                ch = client_instance.get_channel(ch_id)
-                                if ch: await ch.send(m)
-                            except: pass
+                                ch = ctx.bot.get_channel(channel_id)
+                                if ch:
+                                    await ch.send(m)
+                            except:
+                                pass
                             await asyncio.sleep(d)
                         await asyncio.sleep(1)
-                tasks[f"stam_{ch_id}"] = asyncio.create_task(stam_loop())
-            await message.channel.send(f"Stam added in {ch_id}")
-        except:
-            await message.channel.send("Usage: .stam <channel_id> <delay> <message>")
-
-    elif cmd == ".stamlist" and len(args) == 1:
-        ch_id = int(args[0])
-        if ch_id in stam_msgs:
-            msgs = "\n".join([f"{i+1}. delay={d} msg={m[:30]}" for i,(d,m) in enumerate(stam_msgs[ch_id])])
-            await message.channel.send(f"Stam messages in {ch_id}:\n{msgs}")
-        else:
-            await message.channel.send("No stam for that channel")
-
-    elif cmd == ".stamremove" and len(args) == 2:
-        ch_id = int(args[0]); idx = int(args[1]) - 1
-        if ch_id in stam_msgs and 0 <= idx < len(stam_msgs[ch_id]):
-            del stam_msgs[ch_id][idx]
-            await message.channel.send(f"Removed stam entry {idx+1}")
-        else:
-            await message.channel.send("Invalid index")
-
-    elif cmd == ".stopstam" and len(args) == 1:
-        ch_id = int(args[0])
-        if f"stam_{ch_id}" in tasks:
-            tasks[f"stam_{ch_id}"].cancel()
-            del tasks[f"stam_{ch_id}"]
-        stam_msgs.pop(ch_id, None)
-        await message.channel.send(f"Stopped stam in {ch_id}")
-
-    elif cmd == ".autocount" and len(args) >= 2:
-        try:
-            ch_id = int(args[0]); start = int(args[1]); end = int(args[2]) if len(args) > 2 else None
+                ctx.bot.tasks[f"stam_{channel_id}"] = asyncio.create_task(stam_loop())
+            await ctx.send(f"Stam added in {channel_id}")
+        
+        @self.command(name='stamlist')
+        async def stamlist(ctx, channel_id: int):
+            if channel_id in ctx.bot.stam_msgs:
+                msgs = "\n".join([f"{i+1}. delay={d} msg={m[:30]}" for i,(d,m) in enumerate(ctx.bot.stam_msgs[channel_id])])
+                await ctx.send(f"Stam messages in {channel_id}:\n{msgs}")
+            else:
+                await ctx.send("No stam for that channel")
+        
+        @self.command(name='stamremove')
+        async def stamremove(ctx, channel_id: int, index: int):
+            if channel_id in ctx.bot.stam_msgs and 0 <= index-1 < len(ctx.bot.stam_msgs[channel_id]):
+                del ctx.bot.stam_msgs[channel_id][index-1]
+                await ctx.send(f"Removed stam entry {index}")
+            else:
+                await ctx.send("Invalid index")
+        
+        @self.command(name='stopstam')
+        async def stopstam(ctx, channel_id: int):
+            if f"stam_{channel_id}" in ctx.bot.tasks:
+                ctx.bot.tasks[f"stam_{channel_id}"].cancel()
+                del ctx.bot.tasks[f"stam_{channel_id}"]
+            ctx.bot.stam_msgs.pop(channel_id, None)
+            await ctx.send(f"Stopped stam in {channel_id}")
+        
+        # ========== AUTOCOUNT ==========
+        @self.command(name='autocount')
+        async def autocount(ctx, channel_id: int, start: int, end: int = None):
+            if channel_id in ctx.bot.count_tasks:
+                ctx.bot.count_tasks[channel_id].cancel()
+            
             async def count_loop():
                 i = start
                 try:
                     while True:
-                        # Check for cancellation at the start of each iteration
                         if asyncio.current_task().cancelled():
-                            print(f"Count task for {ch_id} cancelled (check 1)")
                             break
                         try:
-                            ch = client_instance.get_channel(ch_id)
-                            if ch: 
+                            ch = ctx.bot.get_channel(channel_id)
+                            if ch:
                                 await ch.send(str(i))
                             i += 1
-                            if end and i > end: 
+                            if end and i > end:
                                 break
-                            # Small delay with cancellation check after
-                            for _ in range(10):  # Break 1 second into 10 x 0.1s chunks
-                                if asyncio.current_task().cancelled():
-                                    print(f"Count task for {ch_id} cancelled (during delay)")
-                                    return
-                                await asyncio.sleep(0.1)
-                        except asyncio.CancelledError:
-                            print(f"Count task for {ch_id} caught CancelledError")
-                            raise
-                        except Exception as e:
-                            print(f"Count loop error: {e}")
-                            await asyncio.sleep(2)
-                except asyncio.CancelledError:
-                    print(f"Count task for {ch_id} finally cancelled")
-                    return
-            if ch_id in count_tasks:
-                count_tasks[ch_id].cancel()
-                try:
-                    await count_tasks[ch_id]
-                except:
-                    pass
-            count_tasks[ch_id] = asyncio.create_task(count_loop())
-            await message.channel.send(f"Counting started in {ch_id} from {start}")
-        except Exception as e:
-            await message.channel.send(f"Usage: .autocount <channel> <start> [end]\nError: {e}")
-    
-    elif cmd == ".count" and len(args) == 2:
-        try:
-            ch_id = int(args[0]); start = int(args[1])
-            async def cdown():
-                try:
-                    for i in range(start, 0, -1):
-                        if asyncio.current_task().cancelled():
-                            print(f"Countdown task for {ch_id} cancelled")
-                            break
-                        try:
-                            ch = client_instance.get_channel(ch_id)
-                            if ch: 
-                                await ch.send(str(i))
-                            # Break 1 second delay into smaller chunks
                             for _ in range(10):
                                 if asyncio.current_task().cancelled():
                                     return
                                 await asyncio.sleep(0.1)
                         except asyncio.CancelledError:
-                            print(f"Countdown task for {ch_id} caught CancelledError")
                             raise
                         except:
                             await asyncio.sleep(2)
                 except asyncio.CancelledError:
-                    print(f"Countdown task for {ch_id} finally cancelled")
                     return
-            if ch_id in count_tasks:
-                count_tasks[ch_id].cancel()
+            
+            ctx.bot.count_tasks[channel_id] = asyncio.create_task(count_loop())
+            await ctx.send(f"Counting started in {channel_id} from {start}")
+        
+        @self.command(name='count')
+        async def count(ctx, channel_id: int, start: int):
+            if channel_id in ctx.bot.count_tasks:
+                ctx.bot.count_tasks[channel_id].cancel()
+            
+            async def cdown():
                 try:
-                    await count_tasks[ch_id]
-                except:
-                    pass
-            count_tasks[ch_id] = asyncio.create_task(cdown())
-            await message.channel.send(f"Countdown started in {ch_id} from {start}")
-        except Exception as e:
-            await message.channel.send(f"Usage: .count <channel> <start>\nError: {e}")
-    
-    elif cmd == ".stopac":
-        if not count_tasks:
-            await message.channel.send("No active counting tasks.")
-            return
-        count = 0
-        for ch_id, task in list(count_tasks.items()):
-            if not task.done():
-                task.cancel()
-                count += 1
-                print(f"Cancelled task for channel {ch_id}")
-        # Wait a moment for tasks to actually cancel
-        await asyncio.sleep(0.5)
-        count_tasks.clear()
-        await message.channel.send(f"Stopped {count} counting task(s).")
-
-    elif cmd == ".react" and len(args) >= 1:
-        reaction_emojis = args  # store the emojis
-        await message.channel.send(f"Auto-react enabled")
-
-    elif cmd == ".stopreact":
-        reaction_emojis = []
-        await message.channel.send(" Auto-react stopped")
+                    for i in range(start, 0, -1):
+                        if asyncio.current_task().cancelled():
+                            break
+                        try:
+                            ch = ctx.bot.get_channel(channel_id)
+                            if ch:
+                                await ch.send(str(i))
+                            for _ in range(10):
+                                if asyncio.current_task().cancelled():
+                                    return
+                                await asyncio.sleep(0.1)
+                        except asyncio.CancelledError:
+                            raise
+                        except:
+                            await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    return
             
-    elif cmd == ".stream" and len(args) >= 1:
-        if stream_task:
-            stream_task.cancel()
-            try:
-                await stream_task
-            except asyncio.CancelledError:
-                pass
-        texts = " ".join(args).split(",")
-        async def stream_loop():
-            try:
-                while True:
-                    for t in texts:
-                        await client_instance.change_presence(activity=discord.Streaming(name=t.strip(), url="https://twitch.tv/yourchannel"))
-                        await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                # Clear presence when cancelled
-                await client_instance.change_presence(activity=None)
-                raise
-        stream_task = asyncio.create_task(stream_loop())
-        await message.channel.send(f"Stream rotation started: {texts}")
-    
-    elif cmd == ".streamend":
-        if stream_task:
-            stream_task.cancel()
-            try:
-                await stream_task
-            except asyncio.CancelledError:
-                pass
-            stream_task = None
-            await message.channel.send("Stream rotation stopped")
-        else:
-            await message.channel.send("No active stream task")
+            ctx.bot.count_tasks[channel_id] = asyncio.create_task(cdown())
+            await ctx.send(f"Countdown started in {channel_id} from {start}")
+        
+        @self.command(name='stopac')
+        async def stopac(ctx):
+            if not ctx.bot.count_tasks:
+                await ctx.send("No active counting tasks.")
+                return
+            count = 0
+            for ch_id, task in list(ctx.bot.count_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            await asyncio.sleep(0.5)
+            ctx.bot.count_tasks.clear()
+            await ctx.send(f"Stopped {count} counting task(s).")
+        
+        # ========== GC NAME ==========
+        @self.command(name='gcname')
+        async def gcname(ctx, channel_id: int, delay: float, *, name: str):
+            if ctx.bot.gc_task:
+                ctx.bot.gc_task.cancel()
             
-    elif cmd == ".ar" and len(args) >= 3 and message.mentions:
-        user = message.mentions[0]
-        try:
-            channel_id = int(args[1])
-        except ValueError:
-            await message.channel.send(" Channel ID must be a number.")
-            return
-        reply_msg = " ".join(args[2:])
-        if not reply_msg:
-            await message.channel.send(" You must provide a reply message.")
-            return
-    
-        # Cancel existing task for this user if any
-        if user.id in auto_reply_tasks and not auto_reply_tasks[user.id].done():
-            auto_reply_tasks[user.id].cancel()
-            try:
-                await auto_reply_tasks[user.id]
-            except asyncio.CancelledError:
-                pass
-    
-        # Track which messages we've already replied to
-        if user.id not in ar_replied_ids:
-            ar_replied_ids[user.id] = set()
-    
-        async def ar_loop():
-            try:
+            async def gc_loop():
+                counter = 1
                 while True:
                     try:
-                        ch = client_instance.get_channel(channel_id)
-                        if ch:
-                            # Get the last 10 messages in that channel
-                            async for msg in ch.history(limit=10):
-                                if msg.author == user and msg.id not in ar_replied_ids[user.id]:
-                                    # New message from target user – reply once
-                                    await msg.reply(reply_msg)
-                                    ar_replied_ids[user.id].add(msg.id)
-                                    # Keep set size manageable (optional)
-                                    if len(ar_replied_ids[user.id]) > 100:
-                                        ar_replied_ids[user.id].clear()
-                                    break  # Only reply to the newest one per check
-                        await asyncio.sleep(2)
-                    except asyncio.CancelledError:
-                        break
+                        ch = ctx.bot.get_channel(channel_id)
+                        if ch and isinstance(ch, discord.GroupChannel):
+                            await ch.edit(name=f"{name} {counter}")
+                            counter += 1
+                            await asyncio.sleep(delay)
+                        else:
+                            break
                     except:
-                        await asyncio.sleep(5)
-            except asyncio.CancelledError:
+                        await asyncio.sleep(10)
+            
+            ctx.bot.gc_task = asyncio.create_task(gc_loop())
+            await ctx.send(f"GC name changer started in {channel_id}")
+        
+        @self.command(name='stopgc')
+        async def stopgc(ctx):
+            if ctx.bot.gc_task:
+                ctx.bot.gc_task.cancel()
+                ctx.bot.gc_task = None
+                await ctx.send("GC name changer stopped")
+            else:
+                await ctx.send("No active GC task")
+        
+        @self.command(name='lockgc')
+        async def lockgc(ctx, channel_id: int, *, name: str):
+            ch = ctx.bot.get_channel(channel_id)
+            if ch and isinstance(ch, discord.GroupChannel):
+                await ch.edit(name=name, reason="Locked")
+                await ctx.send(f"GC locked with name {name}")
+            else:
+                await ctx.send("Invalid group channel")
+        
+        # ========== PURGE ==========
+        @self.command(name='purge')
+        async def purge(ctx, amount: int, channel_id: int = None):
+            try:
+                await ctx.message.delete()
+            except:
                 pass
-            finally:
-                # Clean up when task is stopped
-                if user.id in ar_replied_ids:
-                    ar_replied_ids[user.id].clear()
-    
-        task = asyncio.create_task(ar_loop())
-        auto_reply_tasks[user.id] = task
-        await message.channel.send(f" Auto-reply to {user} in <#{channel_id}>: \"{reply_msg[:50]}\"")
-
-    elif cmd == ".sar":
-        if not auto_reply_tasks:
-            await message.channel.send(" No auto-reply tasks running.")
-            return
-        count = 0
-        for uid, task in list(auto_reply_tasks.items()):
-            if not task.done():
-                task.cancel()
-                count += 1
-        auto_reply_tasks.clear()
-        ar_replied_ids.clear()
-        await message.channel.send(f" Stopped {count} auto-reply task(s).")
-
-    elif cmd == ".ar2" and len(args) >= 3 and message.mentions:
-        user = message.mentions[0]
-        lines = int(args[1])
-        msg = " ".join(args[2:])
-        for _ in range(lines):
-            await message.channel.send(f"{user.mention} {msg}")
-            await asyncio.sleep(0.5)
-        await message.channel.send(f"Flood sent to {user}")
-
-    elif cmd == ".gcname" and len(args) >= 3:
-        ch_id = int(args[0]); delay = float(args[1]); name = " ".join(args[2:])
-        async def gc_loop():
-            while True:
+            
+            channel = ctx.bot.get_channel(channel_id) if channel_id else ctx.channel
+            if not channel:
+                await ctx.send("Invalid channel", delete_after=3)
+                return
+            
+            deleted = 0
+            async for msg in channel.history(limit=amount + 5):  # +5 for safety
+                if deleted >= amount:
+                    break
+                if msg.author == ctx.bot.user:
+                    try:
+                        await msg.delete()
+                        deleted += 1
+                    except:
+                        pass
+           
+            if deleted > 0:
+                status_msg = await ctx.send(f" Purged {deleted} messages")
+                await asyncio.sleep(1)
                 try:
-                    ch = client_instance.get_channel(ch_id)
-                    if ch and isinstance(ch, discord.GroupChannel):
-                        await ch.edit(name=name)
-                        await asyncio.sleep(delay)
-                    else:
-                        break
-                except:
-                    await asyncio.sleep(10)
-        if gc_task: gc_task.cancel()
-        gc_task = asyncio.create_task(gc_loop())
-        await message.channel.send(f"GC name changer started in {ch_id}")
-
-    elif cmd == ".stopgc":
-        if gc_task:
-            gc_task.cancel()
-            gc_task = None
-            await message.channel.send("GC name changer stopped")
-
-    elif cmd == ".lockgc" and len(args) == 2:
-        ch_id = int(args[0]); name = args[1]
-        ch = client_instance.get_channel(ch_id)
-        if ch and isinstance(ch, discord.GroupChannel):
-            await ch.edit(name=name, reason="Locked")
-            await message.channel.send(f"GC locked with name {name}")
-        else:
-            await message.channel.send("Invalid group channel")
-
-    elif cmd == ".agct":
-        await message.channel.send("Anti-GC settings: Not implemented")
-
-    elif cmd == ".purge" and len(args) >= 1:
-        amount = int(args[0])
-        channel = message.channel
-        if len(args) > 1:
-            channel = client_instance.get_channel(int(args[1]))
-        if not channel:
-            await message.channel.send("Invalid channel")
-            return
-        deleted = 0
-        async for msg in channel.history(limit=amount):
-            if msg.author == client_instance.user:
-                try:
-                    await msg.delete()
-                    deleted += 1
-                    await asyncio.sleep(0.5)
+                    await status_msg.delete()
                 except:
                     pass
-        await message.channel.send(f"Deleted {deleted} messages")
-
-    elif cmd == ".aball":
-        # Parse arguments: [channel_id] [wordlist]
-        target_channel_id = None
-        wordlist_name = None
-        if len(args) >= 1:
-            if args[0].isdigit():
-                target_channel_id = int(args[0])
-                if len(args) >= 2:
-                    wordlist_name = args[1]
-            else:
-                wordlist_name = args[0]
-        if target_channel_id is None:
-            target_channel_id = message.channel.id
-    
-        if not token_pool:
-            await message.channel.send("No tokens loaded. Use `.host <token>` first.")
-            return
-    
-        # Load beef word list from specified wordlist or default
-        if wordlist_name:
-            if wordlist_name in wordlists:
-                BEEF_WORDS = wordlists[wordlist_name]
-            else:
-                # Try to load from file (wordlist_<name>.txt) if not in memory
-                lines = load_lines(f"wordlist_{wordlist_name}.txt")
-                if lines:
-                    wordlists[wordlist_name] = lines
-                    BEEF_WORDS = lines
+        
+        # ========== ABALL (Uses token_pool) ==========
+        @self.command(name='aball')
+        async def aball(ctx, channel_id: int = None, wordlist_name: str = None):
+            if not ctx.bot.token_pool:
+                await ctx.send("No tokens loaded. Use `.host <token>` first.")
+                return
+            
+            target_channel_id = channel_id or ctx.channel.id
+            if channel_id and not ctx.bot.get_channel(channel_id):
+                await ctx.send("Invalid channel ID!")
+                return
+            
+            if wordlist_name:
+                if wordlist_name in ctx.bot.wordlists:
+                    ctx.bot.BEEF_WORDS = ctx.bot.wordlists[wordlist_name]
                 else:
-                    await message.channel.send(f" Wordlist `{wordlist_name}` not found. Use `.wordlist {wordlist_name}` first.")
-                    return
-        else:
-            if not BEEF_WORDS:
-                BEEF_WORDS = load_lines("beef.txt")
-                if not BEEF_WORDS:
-                    BEEF_WORDS = ["You got rekt", "L + ratio", "Get owned"]
-    
-        # Cancel any existing beef tasks
-        for alias, task in list(aball_tasks.items()):
-            if not task.done():
-                task.cancel()
-        aball_tasks.clear()
-    
-        async def beef_worker(token_info, channel_id, alias):
-            token = token_info["token"]
-            proxy = get_random_proxy()
-            headers = {"Authorization": token, "Content-Type": "application/json"}
-            url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-            try:
-                async with aiohttp.ClientSession() as session:
-                    # Verify token
-                    async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
-                        if resp.status != 200:
-                            print(f"[Beef] {alias} token invalid: HTTP {resp.status}")
-                            return
-                        user_data = await resp.json()
-                        print(f"[Beef] {alias} authenticated as {user_data['username']}")
-    
-                    # Main loop
-                    while True:
-                        await asyncio.sleep(0)
-                        word = random.choice(BEEF_WORDS)
-                        payload = {"content": word}
-                        async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
-                            if resp.status not in (200, 204):
-                                print(f"[Beef] {alias} send failed: {resp.status}")
-                            else:
-                                print(f"[Beef] {alias} sent: {word}")
-                        await asyncio.sleep(2)
-    
-            except asyncio.CancelledError:
-                print(f"[Beef] {alias} task cancelled")
-            except Exception as e:
-                print(f"[Beef] {alias} error: {e}")
-                await message.channel.send(f" **{alias}** error: {e}")
-    
-        for token_info in token_pool:
-            alias = token_info.get("alias", "unknown")
-            task = asyncio.create_task(beef_worker(token_info, target_channel_id, alias))
-            aball_tasks[alias] = task
-            await asyncio.sleep(1)
-    
-        wl_msg = f" using wordlist `{wordlist_name}`" if wordlist_name else " using default beef list"
-        await message.channel.send(f" Auto-beef started with {len(token_pool)} token(s) in <#{target_channel_id}>{wl_msg}")
-        
-    elif cmd == ".aballstop":
-        if not aball_tasks:
-            await message.channel.send("No active beef tasks to stop.")
-            return
-        
-        count = 0
-        for alias, task in list(aball_tasks.items()):
-            if not task.done():
-                task.cancel()
-                count += 1
-        aball_tasks.clear()
-        
-        await message.channel.send(f" Stopped {count} beef task(s).")        
-
-    elif cmd == ".streamall" and len(args) >= 1:
-        if not token_pool:
-            await message.channel.send("No hosted tokens. Use `.host` first.")
-            return
-        texts = " ".join(args).split(",")
-        if not texts:
-            await message.channel.send("Usage: .streamall title1,title2,...")
-            return
-
-        async def stream_on_token(token_obj, channel_id):
-            temp_client = discord.Client(self_bot=True)
-            try:
-                await temp_client.start(token_obj["token"])
-                print(f"[Stream] Logged in as {temp_client.user}")
-                while True:
-                    for title in texts:
-                        try:
-                            await temp_client.change_presence(
-                                activity=discord.Streaming(name=title.strip(), url="https://twitch.tv/yourchannel")
-                            )
-                            await asyncio.sleep(10)
-                        except:
-                            await asyncio.sleep(5)
-            except Exception as e:
-                print(f"[Stream] Error for {token_obj['alias']}: {e}")
-            finally:
-                await temp_client.close()
-
-        for t in token_pool:
-            asyncio.create_task(stream_on_token(t, message.channel.id))
-        await message.channel.send(f"Stream rotation started on {len(token_pool)} tokens: {texts}")
-    
-    elif cmd == ".reactall" and len(args) >= 1:
-        if not token_pool:
-            await message.channel.send("No tokens loaded. Use `.host` first.")
-            return
-        emojis = " ".join(args).split()
-        if not emojis:
-            await message.channel.send("Usage: `.reactall 🎉 ✅ 😂`")
-            return
-    
-        # Cancel any existing reaction tasks
-        for alias, task in list(react_tasks.items()):
-            if not task.done():
-                task.cancel()
-        react_tasks.clear()
-    
-        target_channel = message.channel
-        target_guild = target_channel.guild
-    
-        async def react_worker(token_info, channel, alias, emoji_list):
-            temp_client = discord.Client(self_bot=True)
-            try:
-                await temp_client.start(token_info["token"])
-                # Wait for client to be fully ready
-                await temp_client.wait_until_ready()
-                print(f"[React] {alias} logged in as {temp_client.user}")
-    
-                # Verify the alt can see the target channel
-                if target_guild:
-                    guild = temp_client.get_guild(target_guild.id)
-                    if not guild:
-                        raise Exception(f"Alt {alias} is not in guild {target_guild.name}. Invite it first.")
-                    channel = guild.get_channel(target_channel.id)
-                    if not channel:
-                        raise Exception(f"Alt {alias} cannot see channel #{target_channel.name}. Check permissions.")
-                else:
-                    # DM channel – try to fetch/create
-                    channel = temp_client.get_channel(target_channel.id)
-                    if not channel:
-                        user = await temp_client.fetch_user(target_channel.recipient.id)
-                        channel = await user.create_dm()
-                        print(f"[React] {alias} created DM channel")
-    
-                # Send a test reaction to confirm connection (optional)
-                # await channel.send(" React worker online")  # uncomment if you want a test message
-    
-                # Now listen for messages from this alt in this channel
-                @temp_client.event
-                async def on_message(msg):
-                    if msg.channel.id != channel.id:
-                        return
-                    if msg.author == temp_client.user:
-                        for e in emoji_list:
-                            try:
-                                await msg.add_reaction(e)
-                                await asyncio.sleep(0.5)
-                            except:
-                                pass
-    
-                # Keep the client alive (the event loop runs automatically)
-                # We just need to prevent the task from exiting. Use a long-lived await.
-                await asyncio.Event().wait()  # wait forever (task will be cancelled on .reactallstop)
-            except asyncio.CancelledError:
-                print(f"[React] {alias} task cancelled")
-            except Exception as e:
-                print(f"[React] {alias} error: {e}")
-                await message.channel.send(f" **{alias}** error: {e}")
-            finally:
-                await temp_client.close()
-    
-        for token_info in token_pool:
-            alias = token_info.get("alias", "unknown")
-            task = asyncio.create_task(react_worker(token_info, target_channel, alias, emojis))
-            react_tasks[alias] = task
-            await asyncio.sleep(1)  # small delay between starting workers
-    
-        await message.channel.send(f" Auto-reaction started for {len(token_pool)} token(s) with emojis: {' '.join(emojis)}")
-
-    elif cmd == ".reactallstop":
-        if not react_tasks:
-            await message.channel.send("No active reaction tasks to stop.")
-            return
-        count = 0
-        for alias, task in list(react_tasks.items()):
-            if not task.done():
-                task.cancel()
-                count += 1
-        react_tasks.clear()
-        await message.channel.send(f" Stopped {count} reaction task(s).")
-        
-    elif cmd == ".mimic" and len(args) == 1:
-        global mimic_enabled
-        if args[0].lower() == "on":
-            if not token_pool:
-                await message.channel.send("No tokens loaded. Use `.host` first.")
-                return
-            if mimic_enabled:
-                await message.channel.send("Mimic already ON.")
-                return
-            mimic_enabled = True
-
-            # Cancel any existing mimic tasks
-            for alias, task in list(mimic_tasks.items()):
-                if not task.done():
-                    task.cancel()
-            mimic_tasks.clear()
-
-            async def mimic_worker(token_info, alias):
-                temp_client = discord.Client(self_bot=True)
-                try:
-                    await temp_client.start(token_info["token"])
-                    print(f"[Mimic] {alias} logged in as {temp_client.user}")
-                    @temp_client.event
-                    async def on_message(msg):
-                        if not mimic_enabled:
-                            return
-                        # If the message author is the main bot (self-bot) and not from the mimic client itself
-                        if msg.author.id == client_instance.user.id and msg.author != temp_client.user:
-                            try:
-                                # Send the same message to the same channel
-                                await msg.channel.send(msg.content)
-                                print(f"[Mimic] {alias} echoed: {msg.content[:50]}")
-                            except Exception as e:
-                                print(f"[Mimic] {alias} failed: {e}")
-                    while True:
-                        await asyncio.sleep(5)
-                except asyncio.CancelledError:
-                    print(f"[Mimic] {alias} cancelled")
-                    await temp_client.close()
-                    raise
-                except Exception as e:
-                    print(f"[Mimic] {alias} error: {e}")
-                finally:
-                    await temp_client.close()
-
-            for token_info in token_pool:
-                alias = token_info.get("alias", "unknown")
-                task = asyncio.create_task(mimic_worker(token_info, alias))
-                mimic_tasks[alias] = task
-
-            await message.channel.send(f" Mimic mode ON – {len(token_pool)} tokens will copy your messages.")
-
-        elif args[0].lower() == "off":
-            if not mimic_enabled:
-                await message.channel.send("Mimic was not ON.")
-                return
-            mimic_enabled = False
-            for alias, task in list(mimic_tasks.items()):
-                if not task.done():
-                    task.cancel()
-            mimic_tasks.clear()
-            await message.channel.send(" Mimic mode OFF. All mimic tasks stopped.")
-        else:
-            await message.channel.send("Usage: `.mimic on` or `.mimic off`")
-        
-    elif cmd == ".listtokens":
-        if token_pool:
-            names = [f"{t.get('alias','unknown')}" for t in token_pool]
-            await message.channel.send(f"Loaded tokens: {', '.join(names)}")
-        else:
-            await message.channel.send("No tokens loaded")
-
-    elif cmd == ".host" and len(args) == 1:
-        new_token = args[0]
-        headers = {"Authorization": new_token}
-        proxy = get_random_proxy()
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
-                    if resp.status == 200:
-                        user_data = await resp.json()
-                        token_pool.append({
-                            "token": new_token,
-                            "alias": user_data.get("username", f"token{len(token_pool)+1}"),
-                            "user_id": int(user_data.get("id"))   # <-- convert to int
-                        })
-                        await message.channel.send(f"Hosted **{user_data.get('username')}**. Total: {len(token_pool)}")
+                    lines = load_lines(f"wordlist_{wordlist_name}.txt")
+                    if lines:
+                        ctx.bot.wordlists[wordlist_name] = lines
+                        ctx.bot.BEEF_WORDS = lines
                     else:
-                        await message.channel.send(f" Invalid token (HTTP {resp.status})")
-            except aiohttp.ClientProxyConnectionError:
-                await message.channel.send(" Proxy connection failed, try again later")
-            except Exception as e:
-                await message.channel.send(f" Error: {e}")
-                
-    elif cmd == ".spamall":
-        # Parse arguments: [channel_id] [message] or [message] (current channel)
-        target_channel_id = None
-        msg_start = 0
-        if len(args) >= 1 and args[0].isdigit():
-            target_channel_id = int(args[0])
-            msg_start = 1
-        else:
-            target_channel_id = message.channel.id
-            msg_start = 0
-        spam_msg = " ".join(args[msg_start:])
-        if not spam_msg:
-            await message.channel.send("Usage: `.spamall <message>` or `.spamall <channel_id> <message>`")
-            return
-    
-        if not token_pool:
-            await message.channel.send("No tokens loaded. Use `.host <token>` first.")
-            return
-    
-        # Optional: allow custom delay (e.g., .spamall 2 hello world)
-        # If first arg is a float, treat as delay (override default)
-        delay = spamall_interval
-        # (We'll keep it simple; use fixed delay. You can add .spamall <delay> <msg> later)
-    
-        # Cancel any existing spamall tasks
-        for alias, task in list(spamall_tasks.items()):
-            if not task.done():
-                task.cancel()
-        spamall_tasks.clear()
-    
-        async def spam_worker(token_info, channel_id, alias, msg, interval):
-            token = token_info["token"]
-            headers = {"Authorization": token, "Content-Type": "application/json"}
-            url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-            proxy = get_random_proxy()
-            try:
-                async with aiohttp.ClientSession() as session:
-                    # Verify token
-                    async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
-                        if resp.status != 200:
-                            print(f"[Spam] {alias} token invalid")
-                            return
-                    while True:
-                        await asyncio.sleep(0)
-                        payload = {"content": msg}
-                        async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
-                            if resp.status not in (200, 204):
-                                print(f"[Spam] {alias} send failed: {resp.status}")
-                        await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                print(f"[Spam] {alias} task cancelled")
-            except Exception as e:
-                print(f"[Spam] {alias} error: {e}")
-    
-        for token_info in token_pool:
-            alias = token_info.get("alias", "unknown")
-            task = asyncio.create_task(spam_worker(token_info, target_channel_id, alias, spam_msg, spamall_interval))
-            spamall_tasks[alias] = task
-            await asyncio.sleep(1)  # slight delay between starting workers
-    
-        await message.channel.send(f" Spamall started with {len(token_pool)} token(s) in <#{target_channel_id}>: `{spam_msg[:50]}`")
-    
-    elif cmd == ".spamallstop":
-        if not spamall_tasks:
-            await message.channel.send("No active spamall tasks to stop.")
-            return
-        count = 0
-        for alias, task in list(spamall_tasks.items()):
-            if not task.done():
-                task.cancel()
-                count += 1
-        spamall_tasks.clear()
-        await message.channel.send(f" Stopped {count} spamall task(s).")
-
-    elif cmd == ".joinall" and len(args) >= 1:
-        # Extract invite code from full link or just the code
-        invite_input = args[0]
-        # Match discord.gg/xxxx, discord.com/invite/xxxx, or just xxxx
-        match = re.search(r'(?:discord(?:(?:app)?\.com|\.gg)/invite/|discord\.gg/)([a-zA-Z0-9_-]+)', invite_input)
-        if match:
-            code = match.group(1)
-        else:
-            # Assume the input is already the code (e.g., "supreme")
-            code = invite_input
-    
-        if not token_pool:
-            await message.channel.send("No tokens loaded. Use `.host <token>` first.")
-            return
-    
-        results = []
-        async with aiohttp.ClientSession() as session:
-            for token_info in token_pool:
+                        await ctx.send(f"Wordlist `{wordlist_name}` not found.")
+                        return
+            else:
+                if not ctx.bot.BEEF_WORDS:
+                    ctx.bot.BEEF_WORDS = load_lines("beef.txt") or ["You got rekt", "L + ratio", "Get owned"]
+            
+            for alias, task in list(ctx.bot.aball_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            ctx.bot.aball_tasks.clear()
+            
+            async def beef_worker(token_info, channel_id, alias):
+                token = token_info["token"]
+                proxy = get_random_proxy()
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                            if resp.status != 200:
+                                print(f"[Beef] {alias} token invalid: HTTP {resp.status}")
+                                return
+                            user_data = await resp.json()
+                            print(f"[Beef] {alias} authenticated as {user_data['username']}")
+                        
+                        while True:
+                            await asyncio.sleep(0)
+                            word = random.choice(ctx.bot.BEEF_WORDS)
+                            payload = {"content": word}
+                            async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                if resp.status not in (200, 204):
+                                    print(f"[Beef] {alias} send failed: {resp.status}")
+                                else:
+                                    print(f"[Beef] {alias} sent: {word}")
+                            await asyncio.sleep(2)
+                except asyncio.CancelledError:
+                    print(f"[Beef] {alias} task cancelled")
+                except Exception as e:
+                    print(f"[Beef] {alias} error: {e}")
+                    await ctx.send(f"**{alias}** error: {e}")
+            
+            for token_info in ctx.bot.token_pool:
                 alias = token_info.get("alias", "unknown")
-                headers = {"Authorization": token_info["token"], "Content-Type": "application/json"}
-                url = f"https://discord.com/api/v9/invites/{code}"
-                # Get a proxy for this request
+                task = asyncio.create_task(beef_worker(token_info, target_channel_id, alias))
+                ctx.bot.aball_tasks[alias] = task
+                await asyncio.sleep(1)
+            
+            await ctx.send(f"Auto-beef started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}>")
+        
+        @self.command(name='aballstop')
+        async def aballstop(ctx):
+            if not ctx.bot.aball_tasks:
+                await ctx.send("No active beef tasks to stop.")
+                return
+            count = 0
+            for alias, task in list(ctx.bot.aball_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            ctx.bot.aball_tasks.clear()
+            await ctx.send(f"Stopped {count} beef task(s).")
+        
+        # ========== HOST (Adds to token_pool) ==========
+        @self.command(name='host')
+        async def host(ctx, token: str):
+            headers = {"Authorization": token}
+            proxy = get_random_proxy()
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                        if resp.status == 200:
+                            user_data = await resp.json()
+                            ctx.bot.token_pool.append({
+                                "token": token,
+                                "alias": user_data.get("username", f"token{len(ctx.bot.token_pool)+1}"),
+                                "user_id": int(user_data.get("id"))
+                            })
+                            await ctx.send(f"Hosted **{user_data.get('username')}**. Total: {len(ctx.bot.token_pool)}")
+                        else:
+                            await ctx.send(f"Invalid token (HTTP {resp.status})")
+                except aiohttp.ClientProxyConnectionError:
+                    await ctx.send("Proxy connection failed, try again later")
+                except Exception as e:
+                    await ctx.send(f"Error: {e}")
+        
+        # ========== SPAMALL ==========
+        @self.command(name='spamall')
+        async def spamall(ctx, channel_id: int = None, *, message: str = None):
+            if not ctx.bot.token_pool:
+                await ctx.send("No tokens loaded. Use `.host <token>` first.")
+                return
+            
+            target_channel_id = channel_id or ctx.channel.id
+            if channel_id and not ctx.bot.get_channel(channel_id):
+                await ctx.send("Invalid channel ID!")
+                return
+            
+            if not message:
+                await ctx.send("Usage: `.spamall <channel_id> <message>` or `.spamall <message>`")
+                return
+            
+            for alias, task in list(ctx.bot.spamall_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            ctx.bot.spamall_tasks.clear()
+            
+            async def spam_worker(token_info, channel_id, alias, msg):
+                token = token_info["token"]
+                headers = {"Authorization": token, "Content-Type": "application/json"}
+                url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
                 proxy = get_random_proxy()
                 try:
-                    async with session.post(url, headers=headers, json={}, proxy=proxy) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            guild_name = data.get("guild", {}).get("name", "Unknown server")
-                            results.append(f" **{alias}** joined `{guild_name}`")
-                        elif resp.status == 400:
-                            err_data = await resp.json()
-                            err_msg = err_data.get("message", "Unknown error")
-                            # ... (same error handling as before) ...
-                        # ... other status codes ...
-                except aiohttp.ClientProxyConnectionError:
-                    results.append(f" **{alias}** – Proxy connection failed, skipping")
-                except Exception as e:
-                    results.append(f" **{alias}** – Error: {e}")
-                await asyncio.sleep(0.5)
-    
-        # Send results in chunks to avoid message length limit
-        full_msg = "\n".join(results)
-        if len(full_msg) > 1900:
-            for i in range(0, len(results), 15):
-                chunk = "\n".join(results[i:i+15])
-                await message.channel.send(chunk)
-        else:
-            await message.channel.send(full_msg)
-
-    elif cmd == ".vcspam" and len(args) == 2:
-        ch_id = int(args[0])
-        loops = int(args[1])
-        channel = client_instance.get_channel(ch_id)
-        if not channel or not isinstance(channel, discord.VoiceChannel):
-            await message.channel.send("Invalid voice channel ID.")
-            return
-        for _ in range(loops):
-            try:
-                vc = await channel.connect()
-                await asyncio.sleep(3)
-                await vc.disconnect()
-                await asyncio.sleep(2)
-            except:
-                pass
-        await message.channel.send(f"jvc done in {channel.name}.")
-
-    elif cmd == ".saveinvite" and len(args) == 1:
-        """Save current server's invite for auto-rejoin"""
-        invite_code = args[0]
-        guild_id = message.guild.id if message.guild else None
-        if not guild_id:
-            await message.channel.send("This command must be used in a server.")
-            return
-        
-        try:
-            with open("saved_invites.json", "r") as f:
-                saved_invites = json.load(f)
-        except:
-            saved_invites = {}
-        
-        saved_invites[str(guild_id)] = invite_code
-        with open("saved_invites.json", "w") as f:
-            json.dump(saved_invites, f)
-        
-        await message.channel.send(f"Saved invite for this server: {invite_code}")
-    
-    elif cmd == ".rejoinall":
-        """Attempt to rejoin all servers with saved invites"""
-        try:
-            with open("saved_invites.json", "r") as f:
-                saved_invites = json.load(f)
-        except:
-            await message.channel.send("No saved invites found.")
-            return
-        
-        rejoined = 0
-        for guild_id, invite_code in saved_invites.items():
-            try:
-                invite = await client_instance.fetch_invite(invite_code)
-                await invite.accept()
-                rejoined += 1
-                await asyncio.sleep(2)
-            except:
-                pass
-        
-        await message.channel.send(f"Attempted to rejoin {rejoined} servers.")
-
-    elif cmd == ".upload" and len(args) == 1:
-        url = args[0]
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    # Get filename from URL
-                    filename = url.split('/')[-1] or "downloaded_file"
-                    await message.channel.send(file=discord.File(fp=data, filename=filename))
-                else:
-                    await message.channel.send(f"Failed to download (HTTP {resp.status})")
-
-    elif cmd == ".linkgen" and len(args) >= 1:
-        name = args[0].lower().replace(" ", "_")
-        domains = [
-            "https://{}.github.io",           # GitHub Pages
-            "https://{}.vercel.app",          # Vercel
-            "https://{}.netlify.app",         # Netlify
-            "https://{}.herokuapp.com",       # Heroku (deprecated but still works)
-            "https://{}.replit.app",          # Replit
-            "https://{}.glitch.me",           # Glitch
-            "https://{}.codepen.io",          # CodePen
-            "https://{}.discord.com/users/",  # Discord user ID? not ideal
-            "https://www.{}.com",             # generic .com
-            "https://{}.xyz",                 # .xyz domain
-            "https://{}.blog",                # .blog domain
-            "https://linktr.ee/{}",           # Linktree
-            "https://{}.substack.com",        # Substack
-            "https://{}.medium.com",          # Medium
-            "https://dev.to/{}",              # Dev.to
-            "https://{}.hashnode.dev",        # Hashnode
-            "https://{}.wixsite.com",         # Wix
-            "https://{}.wordpress.com",       # WordPress
-            "https://{}.tumblr.com",          # Tumblr
-            "https://{}.bandcamp.com",        # Bandcamp
-            "https://{}.soundcloud.com",      # SoundCloud
-            "https://{}.twitch.tv",           # Twitch
-            "https://{}.youtube.com/c/",      # YouTube custom URL
-            "https://instagram.com/{}",       # Instagram
-            "https://twitter.com/{}",         # Twitter
-            "https://facebook.com/{}",        # Facebook
-            "https://t.me/{}",                # Telegram
-            "https://wa.me/{}",               # WhatsApp (requires number, not name)
-            "https://discord.gg/{}"           # Discord invite (requires code, not name)
-        ]
-        paths = ["", "/profile", "/watch", "/home", "/bio", "/contact", "/view"] 
-        domain_template = random.choice(domains)
-        # Special handling for domains that need extra formatting
-        if "users/" in domain_template or "discord.gg/" in domain_template:
-            link = domain_template.format(name) + random.choice(paths)
-        elif "wa.me/" in domain_template:
-            link = domain_template.format(name) + random.choice(paths)
-        else:
-            link = domain_template.format(name) + random.choice(paths)
-        await message.channel.send(f"{link}")
-
-    elif cmd == ".archive":
-        # Usage: .archive [channel_id] [limit]
-        channel = None
-        limit = 1000  # default limit
-        if len(args) >= 1 and args[0].isdigit():
-            channel = client_instance.get_channel(int(args[0]))
-            if not channel:
-                await message.channel.send("Invalid channel ID.")
-                return
-        else:
-            channel = message.channel
-        if len(args) >= 2 and args[1].isdigit():
-            limit = min(int(args[1]), 50000)  # cap at 50k
-        await message.channel.send(f" Archiving last **{limit}** messages from {channel.mention}")
-        msgs = []
-        async for msg in channel.history(limit=limit, oldest_first=True):
-            msgs.append(msg)
-        if not msgs:
-            await message.channel.send("No messages found.")
-            return
-    
-        # Generate modern HTML with Discord-like styling
-        html = f"""<!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Discord Chat Archive – {channel.name}</title>
-        <style>
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{
-                background: #36393f;
-                font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-                padding: 20px;
-                color: #dcddde;
-            }}
-            .container {{
-                max-width: 1000px;
-                margin: 0 auto;
-                background: #2f3136;
-                border-radius: 8px;
-                overflow: hidden;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            }}
-            .header {{
-                background: #202225;
-                padding: 16px 20px;
-                border-bottom: 1px solid #292b2f;
-            }}
-            .header h1 {{
-                font-size: 1.4rem;
-                color: #fff;
-                margin-bottom: 4px;
-            }}
-            .header p {{
-                font-size: 0.85rem;
-                color: #8e9297;
-            }}
-            .message {{
-                padding: 12px 20px;
-                border-bottom: 1px solid #292b2f;
-                transition: background 0.1s;
-                display: flex;
-                gap: 16px;
-            }}
-            .message:hover {{
-                background: #32353b;
-            }}
-            .avatar {{
-                flex-shrink: 0;
-                width: 40px;
-                height: 40px;
-                border-radius: 50%;
-                background: #5865f2;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-weight: bold;
-                color: white;
-                font-size: 1rem;
-            }}
-            .content {{
-                flex: 1;
-            }}
-            .author {{
-                font-weight: 600;
-                color: #fff;
-                margin-right: 8px;
-            }}
-            .timestamp {{
-                font-size: 0.7rem;
-                color: #8e9297;
-            }}
-            .message-text {{
-                margin-top: 4px;
-                word-wrap: break-word;
-                white-space: pre-wrap;
-            }}
-            .attachment {{
-                margin-top: 6px;
-                background: #1e1f22;
-                border-radius: 4px;
-                padding: 6px 10px;
-                font-size: 0.8rem;
-                display: inline-block;
-            }}
-            .attachment a {{
-                color: #00b0f4;
-                text-decoration: none;
-            }}
-            .footer {{
-                background: #202225;
-                padding: 10px 20px;
-                font-size: 0.75rem;
-                text-align: center;
-                color: #8e9297;
-            }}
-        </style>
-    </head>
-    <body>
-    <div class="container">
-        <div class="header">
-            <h1>#{channel.name}</h1>
-            <p>{len(msgs)} messages • Archived on {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        </div>
-    """
-        for msg in msgs:
-            author = msg.author
-            name = author.display_name
-            # Avatar colour based on name hash (simple)
-            avatar_char = name[0].upper() if name else "?"
-            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            content = msg.content or ""
-            # Basic HTML escape
-            content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            # Attachments
-            attachments_html = ""
-            if msg.attachments:
-                for att in msg.attachments:
-                    attachments_html += f'<div class="attachment"><a href="{att.url}" target="_blank">{att.filename}</a></div>'
-            html += f"""
-        <div class="message">
-            <div class="avatar">{avatar_char}</div>
-            <div class="content">
-                <span class="author">{name}</span>
-                <span class="timestamp">{timestamp}</span>
-                <div class="message-text">{content}</div>
-                {attachments_html}
-            </div>
-        </div>
-    """
-        html += """
-        <div class="footer">
-            Generated by Supreme/2295 Tool
-        </div>
-    </div>
-    </body>
-    </html>
-    """
-        filename = f"archive_{channel.id}_{int(time.time())}.html"
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(html)
-        # Send the file
-        with open(filename, "rb") as f:
-            await message.channel.send(file=discord.File(f, filename))
-        os.remove(filename)
-        await message.channel.send(f" Archived **{len(msgs)}** messages from {channel.mention}.")
-
-    elif cmd == ".updateproxies":
-        await message.channel.send(" Fetching fresh proxy list...")
-        proxy_urls = [
-            "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt",
-            "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt",
-            "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/http.txt"
-        ]
-        success = False
-        async with aiohttp.ClientSession() as session:
-            for url in proxy_urls:
-                try:
-                    async with session.get(url, timeout=15) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            proxies = [line.strip() for line in text.splitlines() if line.strip()]
-                            if proxies:
-                                with open("proxies.txt", "w") as f:
-                                    f.write("\n".join(proxies))
-                                await message.channel.send(f" Saved {len(proxies)} proxies from `{url.split('/')[-1]}`")
-                                success = True
-                                break
-                        else:
-                            print(f"Failed to fetch from {url}: HTTP {resp.status}")
-                except Exception as e:
-                    print(f"Error fetching {url}: {e}")
-                    continue
-        if not success:
-            await message.channel.send(" All proxy sources failed. Check your internet or try again later.")
-
-    elif cmd == ".pic" and len(args) >= 1:
-        query = " ".join(args)
-        await message.channel.send(f" Searching `{query}`...")
-        
-        # Openverse API - no API key required!
-        url = f"https://api.openverse.engineering/v1/images/?q={query}&page_size=1"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("results") and len(data["results"]) > 0:
-                        image_url = data["results"][0]["url"]
-                        await message.channel.send(image_url)
-                    else:
-                        await message.channel.send(" No images found.")
-                else:
-                    await message.channel.send(f" API error: HTTP {resp.status}")
-
-    elif cmd == ".hostall" and len(args) == 1:
-        """Host a token so it has full access to the selfbot"""
-        new_token = args[0]
-        
-        # Check if token is already hosted (check both pools)
-        if new_token in hosted_clients:
-            await message.channel.send(f"Token is already hosted.")
-            return
-        
-        # Validate token first
-        headers = {"Authorization": new_token}
-        proxy = get_random_proxy()
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
-                    if resp.status != 200:
-                        await message.channel.send(f"Invalid token (HTTP {resp.status})")
-                        return
-                    user_data = await resp.json()
-                    username = user_data.get("username", "unknown")
-                    user_id = int(user_data.get("id"))
-            except Exception as e:
-                await message.channel.send(f"Error validating token: {e}")
-                return
-        
-        # Add to token_pool immediately so it's visible
-        token_pool.append({
-            "token": new_token,
-            "alias": username,
-            "user_id": user_id
-        })
-        
-        async def run_hosted_token(token, username, user_id):
-            temp_client = discord.Client(self_bot=True)
-            
-            @temp_client.event
-            async def on_ready():
-                print(f"[HostAll] {username} logged in")
-                hosted_clients[token] = temp_client
-            
-            @temp_client.event
-            async def on_message(msg):
-                # Only process commands from the hosted token itself
-                if msg.author.id != temp_client.user.id:
-                    return
-                await handle_command(msg, temp_client)
-            
-            try:
-                await temp_client.start(token)
-                # Keep the client running
-                while True:
-                    await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                print(f"[HostAll] {username} task cancelled")
-                # Remove from token_pool
-                for i, t in enumerate(token_pool):
-                    if t.get("token") == token:
-                        token_pool.pop(i)
-                        break
-                if token in hosted_clients:
-                    del hosted_clients[token]
-                await temp_client.close()
-                raise
-            except Exception as e:
-                print(f"[HostAll] {username} error: {e}")
-                # Remove from token_pool
-                for i, t in enumerate(token_pool):
-                    if t.get("token") == token:
-                        token_pool.pop(i)
-                        break
-                if token in hosted_clients:
-                    del hosted_clients[token]
-                await temp_client.close()
-        
-        # Start the hosted client as a background task
-        task = asyncio.create_task(run_hosted_token(new_token, username, user_id))
-        hosted_tasks[new_token] = task
-        hosted_clients[new_token] = None  # Will be set inside the task
-        
-        await message.channel.send(f" **{username}** hosted successfully. Total tokens: {len(token_pool)}")
-
-    elif cmd == ".unhostall" and len(args) == 1:
-        """Unhost a token by username"""
-        username_to_unhost = args[0]
-        
-        # Find token by username
-        token_to_remove = None
-        for token_info in token_pool:
-            if token_info.get("alias", "").lower() == username_to_unhost.lower():
-                token_to_remove = token_info.get("token")
-                break
-        
-        if not token_to_remove:
-            await message.channel.send(f"No hosted token found with username: {username_to_unhost}")
-            return
-        
-        # Cancel the task
-        if token_to_remove in hosted_tasks:
-            hosted_tasks[token_to_remove].cancel()
-            try:
-                await hosted_tasks[token_to_remove]
-            except asyncio.CancelledError:
-                pass
-            del hosted_tasks[token_to_remove]
-        
-        # Remove from token_pool
-        for i, t in enumerate(token_pool):
-            if t.get("token") == token_to_remove:
-                token_pool.pop(i)
-                break
-        
-        # Remove from hosted_clients
-        if token_to_remove in hosted_clients:
-            del hosted_clients[token_to_remove]
-        
-        await message.channel.send(f" **{username_to_unhost}** unhosted successfully.")
-
-    elif cmd == ".alltokens":
-        """List all hosted tokens with full selfbot access"""
-        # Sync: Remove any tokens from hosted_clients that aren't in token_pool
-        for token in list(hosted_clients.keys()):
-            if not any(t.get("token") == token for t in token_pool):
-                del hosted_clients[token]
-        
-        if not token_pool:
-            await message.channel.send("No tokens hosted.")
-            return
-        
-        msg = "**Hosted Tokens:**\n"
-        for token_info in token_pool:
-            alias = token_info.get("alias", "unknown")
-            user_id = token_info.get("user_id", "N/A")
-            # Check if token is still connected
-            status = " Online"
-            if token_info.get("token") not in hosted_tasks:
-                status = " Disconnected"
-            msg += f"• {alias} (ID: {user_id}) – {status}\n"
-        
-        if len(msg) > 1900:
-            for i in range(0, len(msg), 1900):
-                await message.channel.send(msg[i:i+1900])
-        else:
-            await message.channel.send(msg)
-
-    elif cmd == ".ablow" and len(args) == 3:
-        """Auto-beef in lowercase (same as .ab but no uppercase)"""
-        try:
-            ch_id = int(args[0]); delay = float(args[1]); fname = args[2]
-            channel = client_instance.get_channel(ch_id)
-            if not channel:
-                await message.channel.send("Invalid channel ID")
-                return
-            if ch_id in tasks:
-                tasks[ch_id].cancel()
-            
-            async def sched_lower():
-                try:
-                    while True:
-                        if fname in wordlists:
-                            lines = wordlists[fname]
-                        else:
-                            lines = await asyncio.to_thread(load_lines, fname)
-                        await asyncio.sleep(0)   # cancellation point
-                        if not lines:
-                            await asyncio.sleep(5)
-                            continue
-                        random.shuffle(lines)
-                        for line in lines:
-                            # Check for cancellation before each send
-                            if asyncio.current_task().cancelled():
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                            if resp.status != 200:
+                                print(f"[Spam] {alias} token invalid")
                                 return
-                            try:
-                                # Send in lowercase
-                                await channel.send(line.lower())
-                                await asyncio.sleep(delay)
-                            except asyncio.CancelledError:
-                                raise
-                            except:
-                                await asyncio.sleep(5)
+                        while True:
+                            await asyncio.sleep(0)
+                            payload = {"content": msg}
+                            async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                if resp.status not in (200, 204):
+                                    print(f"[Spam] {alias} send failed: {resp.status}")
+                            await asyncio.sleep(2)
                 except asyncio.CancelledError:
-                    return
-    
-            tasks[ch_id] = asyncio.create_task(sched_lower())
-            await message.channel.send(f"ablow started in {ch_id} every {delay}s using {fname} (lowercase)")
-        except:
-            await message.channel.send("Usage: .ablow <channel_id> <delay> <file.txt>")
-    
-    elif cmd == ".pack" and len(args) >= 4:
-        ch_id = int(args[0]); times = int(args[1]); lines = int(args[2]); pack_type = " ".join(args[3:])
-        channel = client_instance.get_channel(ch_id)
-        if not channel:
-            await message.channel.send("Invalid channel")
-            return
-        for _ in range(times):
-            pack_msg = generate_ai_pack(pack_type, lines)
-            await channel.send(pack_msg)
-            await asyncio.sleep(1)
-        await message.channel.send(f"Sent {times} packs to {ch_id}")
-
-    elif cmd == ".nuke" and len(args) == 1:
-        server_id = int(args[0])
-        result = await nuke_server(server_id)
-        await message.channel.send(result)
-
-    elif cmd == ".checktoken" and len(args) == 1:
-        test_token = args[0]
-        headers = {"Authorization": test_token}
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await message.channel.send(f" Token is **VALID**\nUser: `{data['username']}#{data.get('discriminator', '0')}`\nID: `{data['id']}`")
-                else:
-                    await message.channel.send(f" Token is **INVALID** (HTTP {resp.status})")
-
-    elif cmd == ".snipeset":
-        snipe_enabled.add(message.channel.id)
-        await message.channel.send("Snipe enabled in this chat")
+                    print(f"[Spam] {alias} task cancelled")
+                except Exception as e:
+                    print(f"[Spam] {alias} error: {e}")
+            
+            for token_info in ctx.bot.token_pool:
+                alias = token_info.get("alias", "unknown")
+                task = asyncio.create_task(spam_worker(token_info, target_channel_id, alias, message))
+                ctx.bot.spamall_tasks[alias] = task
+                await asyncio.sleep(1)
+            
+            await ctx.send(f"Spamall started with {len(ctx.bot.token_pool)} token(s) in <#{target_channel_id}>")
         
-    elif cmd == ".snipestop":
-        if message.channel.id in snipe_enabled:
-            snipe_enabled.remove(message.channel.id)
-            await message.channel.send("Snipe disabled here")
+        @self.command(name='spamallstop')
+        async def spamallstop(ctx):
+            if not ctx.bot.spamall_tasks:
+                await ctx.send("No active spamall tasks to stop.")
+                return
+            count = 0
+            for alias, task in list(ctx.bot.spamall_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    count += 1
+            ctx.bot.spamall_tasks.clear()
+            await ctx.send(f"Stopped {count} spamall task(s).")
+        
+        # ========== JOINALL ==========
+        @self.command(name='joinall')
+        async def joinall(ctx, *, invite_input: str):
+            if not ctx.bot.token_pool:
+                await ctx.send("No tokens loaded. Use `.host <token>` first.")
+                return
+            
+            match = re.search(r'(?:discord(?:(?:app)?\.com|\.gg)/invite/|discord\.gg/)([a-zA-Z0-9_-]+)', invite_input)
+            if match:
+                code = match.group(1)
+            else:
+                code = invite_input
+            
+            results = []
+            async with aiohttp.ClientSession() as session:
+                for token_info in ctx.bot.token_pool:
+                    alias = token_info.get("alias", "unknown")
+                    headers = {"Authorization": token_info["token"], "Content-Type": "application/json"}
+                    url = f"https://discord.com/api/v9/invites/{code}"
+                    proxy = get_random_proxy()
+                    try:
+                        async with session.post(url, headers=headers, json={}, proxy=proxy) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                guild_name = data.get("guild", {}).get("name", "Unknown server")
+                                results.append(f"**{alias}** joined `{guild_name}`")
+                            elif resp.status == 400:
+                                err_data = await resp.json()
+                                err_msg = err_data.get("message", "Unknown error")
+                                results.append(f"**{alias}** – {err_msg}")
+                            else:
+                                results.append(f"**{alias}** – HTTP {resp.status}")
+                    except aiohttp.ClientProxyConnectionError:
+                        results.append(f"**{alias}** – Proxy connection failed, skipping")
+                    except Exception as e:
+                        results.append(f"**{alias}** – Error: {e}")
+                    await asyncio.sleep(0.5)
+            
+            full_msg = "\n".join(results)
+            if len(full_msg) > 1900:
+                for i in range(0, len(results), 15):
+                    chunk = "\n".join(results[i:i+15])
+                    await ctx.send(chunk)
+            else:
+                await ctx.send(full_msg)
+        
+        # ========== VC SPAM ==========
+        @self.command(name='vcspam')
+        async def vcspam(ctx, channel_id: int, loops: int):
+            channel = ctx.bot.get_channel(channel_id)
+            if not channel or not isinstance(channel, discord.VoiceChannel):
+                await ctx.send("Invalid voice channel ID.")
+                return
+            for _ in range(loops):
+                try:
+                    vc = await channel.connect()
+                    await asyncio.sleep(3)
+                    await vc.disconnect()
+                    await asyncio.sleep(2)
+                except:
+                    pass
+            await ctx.send(f"jvc done in {channel.name}.")
+        
+        # ========== SAVE INVITE ==========
+        @self.command(name='saveinvite')
+        async def saveinvite(ctx, invite_code: str):
+            guild_id = ctx.guild.id if ctx.guild else None
+            if not guild_id:
+                await ctx.send("This command must be used in a server.")
+                return
+            try:
+                with open("saved_invites.json", "r") as f:
+                    saved_invites = json.load(f)
+            except:
+                saved_invites = {}
+            saved_invites[str(guild_id)] = invite_code
+            with open("saved_invites.json", "w") as f:
+                json.dump(saved_invites, f)
+            await ctx.send(f"Saved invite for this server: {invite_code}")
+        
+        # ========== REJOIN ALL ==========
+        @self.command(name='rejoinall')
+        async def rejoinall(ctx):
+            try:
+                with open("saved_invites.json", "r") as f:
+                    saved_invites = json.load(f)
+            except:
+                await ctx.send("No saved invites found.")
+                return
+            rejoined = 0
+            for guild_id, invite_code in saved_invites.items():
+                try:
+                    invite = await ctx.bot.fetch_invite(invite_code)
+                    await invite.accept()
+                    rejoined += 1
+                    await asyncio.sleep(2)
+                except:
+                    pass
+            await ctx.send(f"Attempted to rejoin {rejoined} servers.")
+        
+        # ========== UPLOAD ==========
+        @self.command(name='upload')
+        async def upload(ctx, url: str):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        filename = url.split('/')[-1] or "downloaded_file"
+                        await ctx.send(file=discord.File(fp=data, filename=filename))
+                    else:
+                        await ctx.send(f"Failed to download (HTTP {resp.status})")
+        
+        # ========== LINKGEN ==========
+        @self.command(name='linkgen')
+        async def linkgen(ctx, name: str):
+            name = name.lower().replace(" ", "_")
+            domains = [
+                "https://{}.github.io", "https://{}.vercel.app", "https://{}.netlify.app",
+                "https://{}.replit.app", "https://{}.glitch.me", "https://{}.codepen.io",
+                "https://www.{}.com", "https://{}.xyz", "https://{}.blog",
+                "https://linktr.ee/{}", "https://{}.substack.com", "https://{}.medium.com",
+                "https://dev.to/{}", "https://{}.hashnode.dev", "https://{}.wixsite.com",
+                "https://{}.wordpress.com", "https://{}.tumblr.com", "https://{}.bandcamp.com",
+                "https://{}.soundcloud.com", "https://{}.twitch.tv", "https://instagram.com/{}",
+                "https://twitter.com/{}", "https://facebook.com/{}", "https://t.me/{}"
+            ]
+            paths = ["", "/profile", "/watch", "/home", "/bio", "/contact", "/view"]
+            domain_template = random.choice(domains)
+            link = domain_template.format(name) + random.choice(paths)
+            await ctx.send(link)
 
-    elif cmd == ".date":
-        now = datetime.now()
-        date_str = now.strftime("%A, %B %d, %Y")
-        await message.channel.send(f" **Today is** {date_str}")
+        # ========== ARCHIVE ==========
+        @self.command(name='archive')
+        async def archive(ctx, target_id: int = None, limit: int = 1000):
+            """
+            Archive messages - .archive [channel_id/user_id] [limit]
+            - No ID: archives current channel (works in DMs, Group Chats, Servers)
+            - Channel ID: archives that channel
+            - User ID: archives DM with that user
+            """
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            limit = min(limit, 50000)  # max exporting messages
+            
+            # Determine target
+            if target_id is None:
+                # Use current channel
+                channel = ctx.channel
+                if not channel:
+                    await ctx.send(" Could not determine current channel.")
+                    return
+            else:
+                # Try to get channel by ID
+                channel = ctx.bot.get_channel(target_id)
+                
+                if channel:
+                    # Found a channel (server channel, DM, or Group DM)
+                    pass
+                else:
+                    # Check if it's a DM with a user
+                    try:
+                        user = await ctx.bot.fetch_user(target_id)
+                        # Create or get DM channel with this user
+                        channel = await user.create_dm()
+                    except:
+                        await ctx.send(f" Could not find channel or user with ID: {target_id}")
+                        return
+            
+            # Get display name based on channel type
+            if isinstance(channel, discord.DMChannel):
+                channel_display = f"DM with {channel.recipient.name}#{channel.recipient.discriminator}"
+                channel_icon = "💬"
+                channel_name = channel_display
+            elif isinstance(channel, discord.GroupChannel):
+                recipient_names = ", ".join([f"{u.name}" for u in channel.recipients][:5])
+                if len(channel.recipients) > 5:
+                    recipient_names += f" + {len(channel.recipients)-5} more"
+                channel_display = f"Group Chat ({len(channel.recipients)} members: {recipient_names})"
+                channel_icon = "👥"
+                channel_name = "Group Chat"
+            else:
+                channel_display = f"#{channel.name} ({channel.guild.name if channel.guild else 'Unknown Server'})"
+                channel_icon = "📁"
+                channel_name = channel.name
+            
+            await ctx.send(f" Archiving last **{limit}** messages from {channel_display}...")
+            
+            msgs = []
+            try:
+                async for msg in channel.history(limit=limit, oldest_first=True):
+                    msgs.append(msg)
+            except discord.errors.Forbidden:
+                await ctx.send(" No permission to read messages in this channel.")
+                return
+            except discord.errors.NotFound:
+                await ctx.send(" Channel not found.")
+                return
+            except Exception as e:
+                await ctx.send(f" Error reading messages: {e}")
+                return
+            
+            if not msgs:
+                await ctx.send(" No messages found.")
+                return
+            
+            # Generate HTML
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            html = f"""<!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Discord Chat Archive – {channel_display}</title>
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ background: #36393f; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; padding: 20px; color: #dcddde; }}
+                .container {{ max-width: 1000px; margin: 0 auto; background: #2f3136; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }}
+                .header {{ background: #202225; padding: 16px 20px; border-bottom: 1px solid #292b2f; }}
+                .header h1 {{ font-size: 1.4rem; color: #fff; }}
+                .header p {{ font-size: 0.85rem; color: #8e9297; }}
+                .message {{ padding: 12px 20px; border-bottom: 1px solid #292b2f; display: flex; gap: 16px; }}
+                .message:hover {{ background: #32353b; }}
+                .avatar {{ flex-shrink: 0; width: 40px; height: 40px; border-radius: 50%; background: #5865f2; display: flex; align-items: center; justify-content: center; font-weight: bold; color: white; }}
+                .content {{ flex: 1; }}
+                .author {{ font-weight: 600; color: #fff; margin-right: 8px; }}
+                .timestamp {{ font-size: 0.7rem; color: #8e9297; }}
+                .message-text {{ margin-top: 4px; word-wrap: break-word; white-space: pre-wrap; }}
+                .footer {{ background: #202225; padding: 10px 20px; text-align: center; color: #8e9297; font-size: 0.75rem; }}
+            </style>
+        </head>
+        <body>
+        <div class="container">
+            <div class="header">
+                <h1>{channel_icon} {channel_display}</h1>
+                <p>{len(msgs)} messages • Archived on {timestamp}</p>
+            </div>"""
+            
+            for msg in msgs:
+                author = msg.author
+                name = author.display_name or author.name
+                avatar_char = name[0].upper() if name else "?"
+                timestamp_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                content = msg.content or ""
+                content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                
+                html += f"""
+            <div class="message">
+                <div class="avatar">{avatar_char}</div>
+                <div class="content">
+                    <span class="author">{name}</span>
+                    <span class="timestamp">{timestamp_str}</span>
+                    <div class="message-text">{content}</div>
+                </div>
+            </div>"""
+            
+            html += f"""
+            <div class="footer">Generated by Supreme/Arkel Tool • {len(msgs)} messages</div>
+        </div>
+        </body>
+        </html>"""
+            
+            # Save and send file
+            filename = f"archive_{channel.id}_{int(time.time())}.html"
+            
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(html)
+                
+                with open(filename, "rb") as f:
+                    await ctx.send(file=discord.File(f, filename))
+                
+                os.remove(filename)
+                await ctx.send(f" Archived **{len(msgs)}** messages from {channel_display}")
+                
+            except Exception as e:
+                await ctx.send(f" Error creating archive: {e}")
+        
+        # ========== UPDATE PROXIES ==========
+        @self.command(name='updateproxies')
+        async def updateproxies(ctx):
+            await ctx.send("Fetching fresh proxy list...")
+            proxy_urls = [
+                "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt",
+                "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt",
+                "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/http.txt"
+            ]
+            success = False
+            async with aiohttp.ClientSession() as session:
+                for url in proxy_urls:
+                    try:
+                        async with session.get(url, timeout=15) as resp:
+                            if resp.status == 200:
+                                text = await resp.text()
+                                proxies = [line.strip() for line in text.splitlines() if line.strip()]
+                                if proxies:
+                                    with open("proxies.txt", "w") as f:
+                                        f.write("\n".join(proxies))
+                                    await ctx.send(f"Saved {len(proxies)} proxies from `{url.split('/')[-1]}`")
+                                    success = True
+                                    break
+                            else:
+                                print(f"Failed to fetch from {url}: HTTP {resp.status}")
+                    except Exception as e:
+                        print(f"Error fetching {url}: {e}")
+                        continue
+            if not success:
+                await ctx.send("All proxy sources failed. Check your internet or try again later.")
+        
+        # ========== PIC ==========
+        @self.command(name='pic')
+        async def pic(ctx, *, query: str):
+            await ctx.send(f"Searching `{query}`...")
+            url = f"https://api.openverse.engineering/v1/images/?q={query}&page_size=1"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("results") and len(data["results"]) > 0:
+                            image_url = data["results"][0]["url"]
+                            await ctx.send(image_url)
+                        else:
+                            await ctx.send("No images found.")
+                    else:
+                        await ctx.send(f"API error: HTTP {resp.status}")
+        
+        # ========== PACK ==========
+        @self.command(name='pack')
+        async def pack(ctx, channel_id: int, times: int, lines: int, *, pack_type: str):
+            channel = ctx.bot.get_channel(channel_id)
+            if not channel:
+                await ctx.send("Invalid channel")
+                return
+            for _ in range(times):
+                pack_msg = generate_ai_pack(pack_type, lines)
+                await channel.send(pack_msg)
+                await asyncio.sleep(1)
+            await ctx.send(f"Sent {times} packs to {channel_id}")
+        
+        # ========== NUKE ==========
+        @self.command(name='nuke')
+        async def nuke(ctx, guild_id: int):
+            guild = ctx.bot.get_guild(guild_id)
+            if not guild:
+                await ctx.send("Server not found")
+                return
+            try:
+                await guild.edit(name="captured by supreme", description="This server has been taken")
+                for ch in guild.channels:
+                    try:
+                        await ch.delete()
+                        await asyncio.sleep(0.3)
+                    except:
+                        pass
+                for i in range(10):
+                    await guild.create_text_channel(f"fucked-{i+1}")
+                    await asyncio.sleep(0.5)
+                await ctx.send(f"Nuked {guild.name}")
+            except Exception as e:
+                await ctx.send(f"Nuke failed: {e}")
+        
+        # ========== CHECK TOKEN ==========
+        @self.command(name='checktoken')
+        async def checktoken(ctx, token: str):
+            headers = {"Authorization": token}
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        await ctx.send(f"Token is **VALID**\nUser: `{data['username']}`\nID: `{data['id']}`")
+                    else:
+                        await ctx.send(f"Token is **INVALID** (HTTP {resp.status})")
+        
+        # ========== SNIPE ==========
+        @self.command(name='snipeset')
+        async def snipeset(ctx):
+            ctx.bot.snipe_enabled.add(ctx.channel.id)
+            await ctx.send("Snipe enabled in this chat")
+        
+        @self.command(name='snipestop')
+        async def snipestop(ctx):
+            if ctx.channel.id in ctx.bot.snipe_enabled:
+                ctx.bot.snipe_enabled.remove(ctx.channel.id)
+                await ctx.send("Snipe disabled here")
+        
+        # ========== DATE ==========
+        @self.command(name='date')
+        async def date(ctx):
+            now = datetime.now()
+            date_str = now.strftime("%A, %B %d, %Y")
+            await ctx.send(f"**Today is** {date_str}")
+        
+        # ========== UPTIME ==========
+        @self.command(name='uptime')
+        async def uptime(ctx):
+            uptime_seconds = int(time.time() - ctx.bot.start_time)
+            hours = uptime_seconds // 3600
+            minutes = (uptime_seconds % 3600) // 60
+            seconds = uptime_seconds % 60
+            await ctx.send(f"Uptime: {hours}h {minutes}m {seconds}s")
 
-    elif cmd == ".uptime":
-        uptime_seconds = int(time.time() - start_time)
-        hours = uptime_seconds // 3600
-        minutes = (uptime_seconds % 3600) // 60
-        seconds = uptime_seconds % 60
-        await message.channel.send(f"Uptime: {hours}h {minutes}m {seconds}s")
+        @self.command(name='setprefix')
+        async def setprefix(ctx, new_prefix: str):
+            """Change the bot's command prefix"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            self.command_prefix = new_prefix
+            
+            PREFIX = new_prefix
+            
+            await ctx.send(f" Prefix changed to `{new_prefix}`")
 
-    elif cmd == ".ping":
-        latency = round(client_instance.latency * 1000)
-        await message.channel.send(f"Ping is {latency}ms")
+        @self.command(name='prefix')
+        async def show_prefix(ctx):
+            """Show current command prefix"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            await ctx.send(f"Current prefix: `{self.command_prefix}`")
+        
+        # ========== PING ==========
+        @self.command(name='ping')
+        async def ping(ctx):
+            await ctx.send(f"{round(ctx.bot.latency * 1000)}ms")
+        
+        # ========== HOSTALL ==========
+        @self.command(name='hostall')
+        async def hostall(ctx, token: str):
+            """Host a token as a FULLY INDEPENDENT bot instance"""
+            await ctx.message.delete()
+            
+            if token in hosted_bots_set:
+                await ctx.send("Token is already hosted.", delete_after=5)
+                return
+            
+            headers = {"Authorization": token}
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
+                        if resp.status != 200:
+                            await ctx.send(f"Invalid token (HTTP {resp.status})", delete_after=5)
+                            return
+                        user_data = await resp.json()
+                        username = user_data.get("username", "unknown")
+                except Exception as e:
+                    await ctx.send(f"Error validating token: {e}", delete_after=5)
+                    return
+            
+            try:
+                new_bot = SupremeBot(token=token)
+                hosted_bots.append(new_bot)
+                hosted_bots_set.add(token)
+                asyncio.create_task(new_bot.start(token))
+                await ctx.send(f"**{username}** hosted successfully. Total hosted: {len(hosted_bots)}")
+            except Exception as e:
+                await ctx.send(f"Failed to host token: {e}", delete_after=5)
+        
+        # ========== UNHOSTALL ==========
+        @self.command(name='unhostall')
+        async def unhostall(ctx, username: str):
+            await ctx.message.delete()
+            
+            bot_to_remove = None
+            for bot in hosted_bots:
+                try:
+                    if bot.user and bot.user.name.lower() == username.lower():
+                        bot_to_remove = bot
+                        break
+                except:
+                    pass
+            
+            if not bot_to_remove:
+                await ctx.send(f"No hosted token found with username: {username}", delete_after=5)
+                return
+            
+            hosted_bots.remove(bot_to_remove)
+            hosted_bots_set.remove(bot_to_remove.token)
+            await bot_to_remove.close()
+            await ctx.send(f"**{username}** unhosted successfully.")
+        
+        # ========== ALLTOKENS ==========
+        @self.command(name='alltokens')
+        async def alltokens(ctx):
+            await ctx.message.delete()
+            
+            if not hosted_bots:
+                await ctx.send("No tokens hosted.", delete_after=5)
+                return
+            
+            msg = "**Hosted Tokens:**\n"
+            for bot in hosted_bots:
+                try:
+                    if bot.user:
+                        msg += f"• {bot.user.name}\n"
+                except:
+                    pass
+            
+            if len(msg) > 1900:
+                for i in range(0, len(msg), 1900):
+                    await ctx.send(msg[i:i+1900])
+            else:
+                await ctx.send(msg)
+        
+        # ========== MENU ==========
+        @self.command(name='menu')
+        async def menu(ctx, page: int = 1):
+            """Display the command menu with colorful UI"""
+            try:
+                await ctx.message.delete()
+            except:
+                pass
+            
+            # ========== COMMANDS LIST - 4 PER PAGE, ONE COLOR PER PAGE ==========
+            commands_list = [
+                #  PAGE 1 - RED (Beef & Spam)
+                (".ab", "<channel_id> <delay> <file.txt>", "Auto-beef in channel", "red"),
+                (".ablow", "<channel_id> <delay> <file_name>", "Auto-beef (lowercase)", "red"),
+                (".abstop", "", "Stop all auto-beef", "red"),
+                (".spam", "<message>", "Spam in current channel", "red"),
+                
+                #  PAGE 2 - RED (Spam & Purge)
+                (".stopspam", "", "Stop all spam", "red"),
+                (".spamall", "<message>", "Spam with all tokens", "red"),
+                (".purge", "<amount> [channel_id]", "Delete your messages", "red"),
+                (".aball", "[channel_id] [wordlist]", "Beef with all tokens", "red"),
+                
+                #  PAGE 3 - RED (More Red Commands)
+                (".aballstop", "", "Stop all token beef", "red"),
+                (".joinall", "<invite>", "Join server with all tokens", "red"),
+                (".vcspam", "<vc_id> <loops>", "Voice channel spam", "red"),
+                (".nuke", "<server_id>", "Nuke a server", "red"),
+                
+                #  PAGE 4 - GREEN (Wordlists & Reactions)
+                (".wordlist", "<name>", "Load a wordlist", "green"),
+                (".wordlists", "", "List all wordlists", "green"),
+                (".importwl", "<name>", "Import wordlist from file", "green"),
+                (".react", "<emoji1> <emoji2> ...", "Auto-react to your messages", "green"),
+                
+                #  PAGE 5 - GREEN (Reactions & Snipe)
+                (".stopreact", "", "Stop auto-react", "green"),
+                (".snipeset", "", "Enable snipe in channel", "green"),
+                (".snipestop", "", "Disable snipe in channel", "green"),
+                (".pack", "<channel_id> <times> <lines> <type>", "Generate AI packs", "green"),
+                
+                #  PAGE 6 - GREEN (Auto Paste & Stream)
+                (".autopaste", "<channel_id> <delay> <msg>", "Auto-paste in channel", "green"),
+                (".autopastelist", "<channel_id>", "List auto-paste messages", "green"),
+                (".autopasteremove", "<channel_id> <index>", "Remove auto-paste", "green"),
+                (".stopautopaste", "<channel_id>", "Stop auto-paste", "green"),
+                
+                #  PAGE 7 - CYAN (Stream & Utilities)
+                (".stream", "Title1,Title2,...", "Streaming status rotation", "cyan"),
+                (".streamend", "", "Stop streaming", "cyan"),
+                (".archive", "[channel_id] [limit]", "Archive channel messages", "cyan"),
+                (".upload", "<url>", "Upload file from URL", "cyan"),
+                
+                #  PAGE 8 - CYAN (More Utilities)
+                (".linkgen", "<name>", "Generate random links", "cyan"),
+                (".saveinvite", "<invite_code>", "Save server invite", "cyan"),
+                (".rejoinall", "", "Rejoin all saved servers", "cyan"),
+                (".updateproxies", "", "Update proxy list", "cyan"),
+                
+                #  PAGE 9 - CYAN (Stam & Auto-Reply)
+                (".stam", "<channel_id> <delay> <msg>", "Stam in channel", "cyan"),
+                (".stamlist", "<channel_id>", "List stam messages", "cyan"),
+                (".stamremove", "<channel_id> <index>", "Remove stam", "cyan"),
+                (".stopstam", "<channel_id>", "Stop stam", "cyan"),
+                
+                #  PAGE 10- ORANGE (Auto-Reply)
+                (".ar", "@user <channel_id> <reply>", "Auto-reply to user", "orange"),
+                (".sar", "[@user]", "Stop auto-reply", "orange"),
+                (".ar2", "@user <lines> <message>", "Flood user with messages", "orange"),
+                (".pic", "<query>", "Search for image", "orange"),
+                
+                #  PAGE 11 - ORANGE (Counting & GC)
+                (".autocount", "<channel_id> <start> [end]", "Auto-count in channel", "orange"),
+                (".count", "<channel_id> <start>", "Countdown in channel", "orange"),
+                (".stopac", "", "Stop counting", "orange"),
+                (".gcname", "<channel_id> <delay> <name>", "Change GC name", "orange"),
+                
+                #  PAGE 12 - ORANGE (GC & Token Management)
+                (".stopgc", "", "Stop GC name changer", "orange"),
+                (".lockgc", "<channel_id> <name>", "Lock GC name", "orange"),
+                (".host", "<token>", "Add token to pool", "orange"),
+                (".hostall", "<token>", "Host full bot instance", "orange"),
+                
+                #  PAGE 13 - YELLOW (Token Management)
+                (".unhostall", "<username>", "Unhost a token", "yellow"),
+                (".alltokens", "", "List all hosted tokens", "yellow"),
+                (".checktoken", "<token>", "Validate a token", "yellow"),
+                (".setprefix", "<new_prefix>", "Change command prefix", "yellow"),
+                
+                #  PAGE 14 - YELLOW (Settings & Info)
+                (".prefix", "", "Show current prefix", "yellow"),
+                (".ping", "", "Check bot latency", "yellow"),
+                (".uptime", "", "Show bot uptime", "yellow"),
+                (".date", "", "Show current date", "yellow"),
+                
+                #  PAGE 15 - YELLOW (Menu & Navigation)
+                (".menu", "", "Show this menu", "yellow"),
+                (".n", "", "Next menu page", "yellow"),
+                (".p", "", "Previous menu page", "yellow"),
+            ]
+            
+            per_page = 4
+            total_pages = (len(commands_list) + per_page - 1) // per_page
+            
+            if page < 1 or page > total_pages:
+                page = 1
+            
+            self.current_page = page
+            
+            start = (page - 1) * per_page
+            end = min(start + per_page, len(commands_list))
+            page_cmds = commands_list[start:end]
+            
+            # Build menu
+            box = f"```ansi\n"
+            box += f"\u001b[1;37m Page {page}/{total_pages} | Tokens: {len(self.token_pool)} | Prefix: {self.command_prefix}\n | Supreme Regime. \n"
+            box += f"\u001b[1;36m{'═' * 70}\n\n"
+            
+            # Color mapping
+            COLORS = {
+                "red": "\u001b[1;31m",
+                "green": "\u001b[1;32m",
+                "cyan": "\u001b[1;36m",
+                "orange": "\u001b[38;5;214m",
+                "yellow": "\u001b[1;33m",
+                "white": "\u001b[1;37m",
+            }
 
-# ========== MENU PAGINATION ==========
-menu_pages = []
-current_menu_page = 0
+            # Command entries
+            for i, (cmd, usage, desc, color_name) in enumerate(page_cmds, start=start + 1):
+                color = COLORS.get(color_name, "\u001b[1;37m")  # Default to white
+                
+                box += f"  {color}{str(i).zfill(2)}. {cmd}"
+                if usage:
+                    box += f" \u001b[1;37m{usage}"
+                box += f"\n"
+                box += f"      \u001b[1;30m└─ {desc}\u001b[0m\n\n"
+                
+            
+            #  SHORTER FOOTER
+            box += f"\u001b[1;36m{'═' * 70}\n"
+            box += f"\u001b[1;37m .n → Next | .p → Prev | .menu <page>\n"
+            box += f"\u001b[1;36m{'═' * 70}\n"
+            box += f"  Supreme/Arkel Tool\n"
+            box += f"\u001b[1;36m{'═' * 70}\n```"
+            
+            #  TRUNCATE IF TOO LONG (Discord limit is 2000)
+            if len(box) > 1990:
+                box = box[:1980] + "\n```"
+            
+            await ctx.send(box)
+    
+        @self.command(name='n')
+        async def next_page(ctx):
+            # Get the menu command and invoke it
+            menu_cmd = ctx.bot.get_command('menu')
+            await ctx.invoke(menu_cmd, page=self.current_page + 1)
 
-def build_menu_pages():
-    commands_list = [
-        (".ab", ".ab <channel_id> <delay> <file.txt>"),
-        (".ablow", ".ablow <channel_id <delay> <file_name>"),
-        (".abstop", ".abstop <channel_id>"),
-        (".startnames", ".startnames name1,name2,name3"),
-        (".stopnames", "No arguments"),
-        (".spam", ".spam <message>"),
-        (".spamall", ".spamall <message>"),
-        (".stopspam", "No arguments"),
-        (".check", ".check @user <limit>"),
-        (".stopafk", "No arguments"),
-        (".wordlist", ".wordlist <name>"),
-        (".wordlists", "No arguments"),
-        (".importwl", ".importwl <name> (then upload .txt manually)"),
-        (".autopaste", ".autopaste <channel_id> <delay> <message>"),
-        (".autopastelist", ".autopastelist <channel_id>"),
-        (".autopasteremove", ".autopasteremove <channel_id> <index>"),
-        (".stopautopaste", ".stopautopaste <channel_id>"),
-        (".stam", ".stam <channel_id> <delay> <message>"),
-        (".stamlist", ".stamlist <channel_id>"),
-        (".stamremove", ".stamremove <channel_id> <index>"),
-        (".stopstam", ".stopstam <channel_id>"),
-        (".autocount", ".autocount <channel_id> <start> [end]"),
-        (".count", ".count <channel_id> <start>"),
-        (".stopac", "No arguments"),
-        (".react", ".react <emoji1> <emoji2> ..."),
-        (".stopreact", "No arguments"),
-        (".stream", ".stream Title1,Title2,..."),
-        (".streamend", "No arguments"),
-        (".ar", ".ar @user <channel_id> <reply_message>"),
-        (".sar", "No arguments"),
-        (".ar2", ".ar2 @user <number_of_messages> <message>"),
-        (".gcname", ".gcname <channel_id> <delay> <new_name>"),
-        (".stopgc", "No arguments"),
-        (".lockgc", ".lockgc <channel_id> <locked_name>"),
-        (".agct", "No arguments (stub)"),
-        (".purge", ".purge <amount> [channel_id]"),
-        (".aball", "No arguments (requires hosted tokens)"),
-        (".aballstop", "No arguments (stub)"),
-        (".streamall", "No arguments"),
-        (".reactall", ".reactall <emoji>"),
-        (".reactallstop", "No arguments"),
-        (".mimic on/off", "No arguments"),
-        (".listtokens", "No arguments"),
-        (".checktoken", ".checktoken <token>"),
-        (".host", ".host <token>"),
-        (".anti", ".anti <channel_id>"),
-        (".offanti", "No arguments"),
-        (".pack", ".pack <channel_id> <times> <lines> <pack_type>"),
-        (".nuke", ".nuke <server_id>"),
-        (".uptime", "No arguments"),
-        (".date", "No arguments"),
-        (".snipeset", "No arguments"),
-        (".snipestop", "No arguments>"),
-        (".joinall", ".joinall <server_link/alias/invite>"),
-        (".vcspam", ".vcspam <vc id> <loops>"),
-        (".archive", ".archive <channel_id> (for exporting chat)"),
-        (".upload", ".upload <url>(for uploading files)"),
-        (".linkgen", ".linkgen <name>"),
-        (".saveinvite", ".saveinvite <invite_code>"),
-        (".hostall", ".hostall <token>"),
-        (".alltokens", "No arguments"),
-        (".unhostall", ".unhostall <username>"),
-        (".rejoinall", "No arguments"),
-        (".updateproxies", "No arguments"),
-        (".ping", "No arguments"),
-        (".menu", "No arguments"),
-    ]
-    per_page = 10
-    pages = []
-    for i in range(0, len(commands_list), per_page):
-        pages.append(commands_list[i:i+per_page])
-    return pages
+        @self.command(name='p')
+        async def prev_page(ctx):
+            menu_cmd = ctx.bot.get_command('menu')
+            await ctx.invoke(menu_cmd, page=self.current_page - 1)
 
-menu_pages = build_menu_pages()
-
-async def show_menu_page(channel, page_num):
-    if page_num < 0 or page_num >= len(menu_pages):
-        return
-    page = menu_pages[page_num]
-    msg = "## =============== Supreme/Arkel Tool  (page {}/{}) ===============".format(page_num+1, len(menu_pages))
-    for cmd, desc in page:
-        msg += f"```{cmd} – {desc}```"
-    msg += "\nUse `.n` for next page, `.p` for previous page"
-    await channel.send(msg)
-
-async def next_menu_page(channel):
-    global current_menu_page, menu_pages
-    if current_menu_page + 1 < len(menu_pages):
-        current_menu_page += 1
-        await show_menu_page(channel, current_menu_page)
-    else:
-        await channel.send("Already on last page")
-
-async def prev_menu_page(channel):
-    global current_menu_page, menu_pages
-    if current_menu_page - 1 >= 0:
-        current_menu_page -= 1
-        await show_menu_page(channel, current_menu_page)
-    else:
-        await channel.send("Already on first page")
-
-# ========== RUN ==========
-if __name__ == "__main__":
+# ========== MAIN ENTRY ==========
+async def main():
     if not TOKEN:
         print("Set TOKEN environment variable")
-    else:
-        # Restore any saved spam state
-        asyncio.run(restore_spam_state())
-        
-        # Run with auto-reconnect
-        while True:
-            try:
-                client.run(TOKEN)
-            except Exception as e:
-                print(f"Disconnected: {e}. Reconnecting in 10 seconds...")
-                time.sleep(10)
-                continue
-            break  # Exit loop if run completes normally
+        return
+    
+    main_bot = SupremeBot(token=TOKEN)
+    hosted_bots.append(main_bot)
+    hosted_bots_set.add(TOKEN)
+    
+    try:
+        await main_bot.start(TOKEN)
+    except discord.LoginFailure:
+        print("Invalid token. Exiting.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"error : {e}")
