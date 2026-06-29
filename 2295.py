@@ -916,14 +916,13 @@ class SupremeBot(commands.Bot):
             
             async def beef_worker(token_info, channel_id, alias):
                 token = token_info["token"]
-                proxy = get_random_proxy()
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
                 
                 async with aiohttp.ClientSession() as session:
                     try:
                         #  Verify token
-                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
                             if resp.status != 200:
                                 print(f"[Beef] {alias} token invalid: HTTP {resp.status}")
                                 return
@@ -938,7 +937,7 @@ class SupremeBot(commands.Bot):
                             payload = {"content": word}
                             
                             try:
-                                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                async with session.post(url, json=payload, headers=headers) as resp:
                                     if resp.status in (200, 204):
                                         pass
                                     else:
@@ -982,10 +981,9 @@ class SupremeBot(commands.Bot):
         @self.command(name='host')
         async def host(ctx, token: str):
             headers = {"Authorization": token}
-            proxy = get_random_proxy()
             async with aiohttp.ClientSession() as session:
                 try:
-                    async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                    async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
                         if resp.status == 200:
                             user_data = await resp.json()
                             ctx.bot.token_pool.append({
@@ -1026,17 +1024,16 @@ class SupremeBot(commands.Bot):
                 token = token_info["token"]
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-                proxy = get_random_proxy()
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
                             if resp.status != 200:
                                 print(f"[Spam] {alias} token invalid")
                                 return
                         while True:
                             await asyncio.sleep(0)
                             payload = {"content": msg}
-                            async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                            async with session.post(url, json=payload, headers=headers) as resp:
                                 if resp.status not in (200, 204):
                                     print(f"[Spam] {alias} send failed: {resp.status}")
                             await asyncio.sleep(2)
@@ -1085,9 +1082,8 @@ class SupremeBot(commands.Bot):
                     alias = token_info.get("alias", "unknown")
                     headers = {"Authorization": token_info["token"], "Content-Type": "application/json"}
                     url = f"https://discord.com/api/v9/invites/{code}"
-                    proxy = get_random_proxy()
                     try:
-                        async with session.post(url, headers=headers, json={}, proxy=proxy) as resp:
+                        async with session.post(url, headers=headers, json={}) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 guild_name = data.get("guild", {}).get("name", "Unknown server")
@@ -1578,14 +1574,13 @@ class SupremeBot(commands.Bot):
             
             async def react_worker(token_info, channel_id, alias, emojis):
                 token = token_info["token"]
-                proxy = get_random_proxy()
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
                 
                 async with aiohttp.ClientSession() as session:
                     try:
                         # Verify token
-                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
                             if resp.status != 200:
                                 print(f"[MultiReact] {alias} token invalid: HTTP {resp.status}")
                                 return
@@ -1594,7 +1589,7 @@ class SupremeBot(commands.Bot):
                         
                         # Get recent messages in channel
                         msg_ids = []
-                        async with session.get(url, headers=headers, proxy=proxy) as resp:
+                        async with session.get(url, headers=headers) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 for msg in data:
@@ -1608,7 +1603,7 @@ class SupremeBot(commands.Bot):
                             for emoji in emojis:
                                 try:
                                     react_url = f"https://discord.com/api/v9/channels/{channel_id}/messages/{msg_id}/reactions/{emoji}/@me"
-                                    async with session.put(react_url, headers=headers, proxy=proxy) as resp:
+                                    async with session.put(react_url, headers=headers) as resp:
                                         if resp.status in (200, 204):
                                             pass
                                         else:
@@ -1686,14 +1681,13 @@ class SupremeBot(commands.Bot):
             
             async def stam_worker(token_info, channel_id, alias, msg, delay):
                 token = token_info["token"]
-                proxy = get_random_proxy()
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
                 
                 async with aiohttp.ClientSession() as session:
                     try:
                         # Verify token
-                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
                             if resp.status != 200:
                                 print(f"[MultiStam] {alias} token invalid: HTTP {resp.status}")
                                 return
@@ -1710,7 +1704,7 @@ class SupremeBot(commands.Bot):
                             payload = {"content": msg_with_count}
                             
                             try:
-                                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                async with session.post(url, json=payload, headers=headers) as resp:
                                     if resp.status in (200, 204):
                                         pass
                                     else:
@@ -1790,14 +1784,13 @@ class SupremeBot(commands.Bot):
             
             async def count_worker(token_info, channel_id, alias, start_num, stop_num, token_index, total_tokens):
                 token = token_info["token"]
-                proxy = get_random_proxy()
                 headers = {"Authorization": token, "Content-Type": "application/json"}
                 url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
                 
                 async with aiohttp.ClientSession() as session:
                     try:
                         # Verify token
-                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers, proxy=proxy) as resp:
+                        async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
                             if resp.status != 200:
                                 print(f"[MultiCount] {alias} token invalid: HTTP {resp.status}")
                                 return
@@ -1819,7 +1812,7 @@ class SupremeBot(commands.Bot):
                             payload = {"content": str(current)}
                             
                             try:
-                                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
+                                async with session.post(url, json=payload, headers=headers) as resp:
                                     if resp.status in (200, 204):
                                         pass
                                     else:
